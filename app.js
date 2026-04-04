@@ -27,8 +27,7 @@ function saveDB(data) {
 }
 
 function initDB() {
-  const now = new Date();
-  const year = now.getFullYear();
+  const now = new Date(), year = now.getFullYear();
   const db = {
     users: [
       { id:1, employeeId:'A001', name:'系統管理員', email:'admin@company.com', password:'admin123', departmentId:3, role:'admin', salary:80000, status:'active', hireDate:'2020-01-01' },
@@ -76,106 +75,84 @@ function initDB() {
   return db;
 }
 
+// ============================================================
+// ATTENDANCE / SCHEDULE GENERATORS
+// ============================================================
+const SHIFT_CFG = {
+  morning:   { startH:9, startM:0, endH:18, endM:0, earlyBase:8, earlyRange:15 },
+  afternoon: { startH:14, startM:0, endH:22, endM:0, earlyBase:13, earlyRange:15 },
+  night:     { startH:22, startM:0, endH:6, endM:0, earlyBase:21, earlyRange:15 }
+};
+const UID_SHIFT_MAP = { 9:'afternoon', 10:'afternoon', 11:'night', 12:'night' };
+
+function pad2(n) { return String(n).padStart(2, '0'); }
+function minToTime(m) { return `${pad2(Math.floor(m / 60))}:${pad2(m % 60)}`; }
+
 function generateSampleAttendance() {
   const records = [];
-  const now = new Date();
-  const year = now.getFullYear();
-  const month = now.getMonth();
+  const now = new Date(), year = now.getFullYear(), month = now.getMonth();
   let id = 1;
-  // Seed a simple deterministic random so data is consistent
   let seed = year * 10000 + month * 100 + now.getDate();
   function srand() { seed = (seed * 16807 + 7) % 2147483647; return (seed & 0x7fffffff) / 2147483647; }
-
-  // shift config for attendance generation
-  const shiftCfg = {
-    morning:   { startH:9, startM:0, endH:18, earlyBase:8, earlyRange:15 },
-    afternoon: { startH:14, startM:0, endH:22, earlyBase:13, earlyRange:15 },
-    night:     { startH:22, startM:0, endH:6, earlyBase:21, earlyRange:15 }
-  };
-  // uid -> default shift
-  const uidShift = { 9:'afternoon', 10:'afternoon', 11:'night', 12:'night' };
 
   for (let d = 29; d >= 0; d--) {
     const date = new Date(year, month, now.getDate() - d);
     if (date.getDay() === 0 || date.getDay() === 6) continue;
     const dateStr = fmtDate(date);
+    const nowMin = now.getHours() * 60 + now.getMinutes();
+
     for (let uid = 2; uid <= 12; uid++) {
       let clockIn, clockOut, status = 'normal', lateMins = 0, earlyMins = 0;
       const r1 = srand(), r2 = srand();
-      const shift = uidShift[uid] || 'morning';
-      const cfg = shiftCfg[shift];
-
-      // 5% absent (not today)
-      if (r1 < 0.05 && d > 0) continue;
-
-      // Today: skip if current time is before shift start
-      const nowMin = now.getHours() * 60 + now.getMinutes();
+      const shift = UID_SHIFT_MAP[uid] || 'morning';
+      const cfg = SHIFT_CFG[shift];
       const shiftStartMin = cfg.startH * 60 + cfg.startM;
+      const shiftEndMin = cfg.endH * 60 + (cfg.endM || 0);
+      const crossesMidnight = shiftEndMin < shiftStartMin;
+
+      if (r1 < 0.05 && d > 0) continue;
       if (d === 0 && nowMin < shiftStartMin - 15) continue;
 
-      // 20% chance late
       if (r1 < 0.20) {
-        const lateBy = Math.floor(srand() * 25) + 5;
-        const totalMin = cfg.startH * 60 + cfg.startM + lateBy;
-        clockIn = `${String(Math.floor(totalMin/60)).padStart(2,'0')}:${String(totalMin%60).padStart(2,'0')}`;
-        lateMins = lateBy;
+        lateMins = Math.floor(srand() * 25) + 5;
+        clockIn = minToTime(shiftStartMin + lateMins);
         status = 'late';
       } else {
-        const m = cfg.earlyBase * 60 + Math.floor(srand() * cfg.earlyRange) + 45;
-        clockIn = `${String(Math.floor(m/60)).padStart(2,'0')}:${String(m%60).padStart(2,'0')}`;
+        clockIn = minToTime(cfg.earlyBase * 60 + Math.floor(srand() * cfg.earlyRange) + 45);
       }
 
-      // Today: if clockIn time is in the future, skip
       if (d === 0) {
         const [ciH, ciM] = clockIn.split(':').map(Number);
         if (ciH * 60 + ciM > nowMin) continue;
-      }
-
-      // Clock out
-      if (d === 0) {
-        // Today: if past shift end, 80% already clocked out normally, 20% overtime
-        const shiftStartMin = cfg.startH * 60 + (cfg.startM || 0);
-        const shiftEndMin = cfg.endH * 60 + (cfg.endM || 0);
-        // Handle overnight shifts (e.g. 22:00-06:00): shift ended if nowMin > endMin AND nowMin < startMin
-        const crossesMidnight = shiftEndMin < shiftStartMin;
         const shiftEnded = crossesMidnight
           ? (nowMin > shiftEndMin && nowMin < shiftStartMin)
           : (nowMin > shiftEndMin);
         if (shiftEnded) {
-          if (srand() < 0.8) {
-            const extra = Math.floor(srand() * 15);
-            clockOut = `${String(cfg.endH).padStart(2,'0')}:${String(extra).padStart(2,'0')}`;
-          } else {
-            clockOut = null; // still working overtime
-          }
+          clockOut = srand() < 0.8 ? `${pad2(cfg.endH)}:${pad2(Math.floor(srand() * 15))}` : null;
         } else {
-          clockOut = null; // shift not over yet
+          clockOut = null;
         }
       } else {
-        // For yesterday's overnight shift: if now is before shift end, they're still working
         const isCrossMidnight = cfg.endH < cfg.startH;
         if (d === 1 && isCrossMidnight && nowMin < cfg.endH * 60 + (cfg.endM || 0)) {
-          clockOut = null; // still working from yesterday's night shift
+          clockOut = null;
         } else if (r2 < 0.15) {
-          const earlyBy = Math.floor(srand() * 25) + 5;
-          const totalMin = cfg.endH * 60 - earlyBy;
-          clockOut = `${String(Math.floor(totalMin/60)).padStart(2,'0')}:${String(totalMin%60).padStart(2,'0')}`;
-          earlyMins = earlyBy;
+          earlyMins = Math.floor(srand() * 25) + 5;
+          clockOut = minToTime(cfg.endH * 60 - earlyMins);
           status = status === 'late' ? 'late+early' : 'early';
         } else {
-          const extra = Math.floor(srand() * 25);
-          clockOut = `${String(cfg.endH).padStart(2,'0')}:${String(extra).padStart(2,'0')}`;
+          clockOut = `${pad2(cfg.endH)}:${pad2(Math.floor(srand() * 25))}`;
         }
       }
       records.push({ id: id++, userId: uid, date: dateStr, clockIn, clockOut, status, lateMinutes: lateMins, earlyLeaveMinutes: earlyMins, shift });
     }
   }
+
   // Guaranteed early leave records (yesterday)
   const yesterday = new Date(year, month, now.getDate() - 1);
   if (yesterday.getDay() !== 0 && yesterday.getDay() !== 6) {
     const yd = fmtDate(yesterday);
-    const replace = [5, 7, 10, 12];
-    replace.forEach(uid => {
+    [5, 7, 10, 12].forEach(uid => {
       const idx = records.findIndex(r => r.userId === uid && r.date === yd);
       if (idx >= 0) records.splice(idx, 1);
     });
@@ -188,23 +165,16 @@ function generateSampleAttendance() {
 }
 
 function generateLeaveBalances(year) {
-  const types = ['特休','病假','事假','婚假','喪假'];
-  const days = [7, 30, 14, 8, 8];
-  const balances = [];
+  const types = ['特休','病假','事假','婚假','喪假'], days = [7, 30, 14, 8, 8], balances = [];
   let id = 1;
-  for (let uid = 1; uid <= 12; uid++) {
-    types.forEach((t, i) => {
-      balances.push({ id: id++, userId: uid, leaveType: t, totalDays: days[i], usedDays: Math.floor(Math.random() * Math.min(3, days[i])), year });
-    });
-  }
+  for (let uid = 1; uid <= 12; uid++)
+    types.forEach((t, i) => { balances.push({ id: id++, userId: uid, leaveType: t, totalDays: days[i], usedDays: Math.floor(Math.random() * Math.min(3, days[i])), year }); });
   return balances;
 }
 
 function generateDefaultSchedules(now) {
   const schedules = [];
   let id = 1;
-  const year = now.getFullYear(), month = now.getMonth();
-  // Generate schedules for current week + next week
   const weekStart = new Date(now);
   weekStart.setDate(now.getDate() - (now.getDay() === 0 ? 6 : now.getDay() - 1));
   for (let w = 0; w < 14; w++) {
@@ -212,10 +182,8 @@ function generateDefaultSchedules(now) {
     d.setDate(weekStart.getDate() + w);
     if (d.getDay() === 0 || d.getDay() === 6) continue;
     const dateStr = fmtDate(d);
-    // 許志偉、鄭雅琪 → 中班
     schedules.push({ id: id++, userId: 9, date: dateStr, shiftType: 'afternoon' });
     schedules.push({ id: id++, userId: 10, date: dateStr, shiftType: 'afternoon' });
-    // 蔡明翰、周佩君 → 晚班
     schedules.push({ id: id++, userId: 11, date: dateStr, shiftType: 'night' });
     schedules.push({ id: id++, userId: 12, date: dateStr, shiftType: 'night' });
   }
@@ -234,107 +202,65 @@ try { db = loadDB(); } catch(e) { console.error('DB init error:', e); db = initD
 // 每天不同，一週為單位無限循環
 // 只有系統管理員需要自己手動打卡操控
 // ============================================================
-
-// Auto-generate realistic attendance for today so the demo doesn't look empty
 function ensureTodayAttendance(excludeUserId) {
   const todayStr = fmtDate(new Date());
   const now = new Date();
   const nowMin = now.getHours() * 60 + now.getMinutes();
   if (db.lastAttendanceDate === todayStr) return;
 
-  // Fixed shift mapping
-  const uidShift = { 9:'afternoon', 10:'afternoon', 11:'night', 12:'night' };
-  const shiftCfg = {
-    morning:   { startH:9, endH:18, earlyBase:8 },
-    afternoon: { startH:14, endH:22, earlyBase:13 },
-    night:     { startH:22, endH:6, earlyBase:21 }
-  };
+  const shiftCfg = { morning: { startH:9, endH:18, earlyBase:8 }, afternoon: { startH:14, endH:22, earlyBase:13 }, night: { startH:22, endH:6, earlyBase:21 } };
 
   // Weekly pattern: which user IDs are late / early each day (loops every 7 days)
   // day 0=Sun,1=Mon,2=Tue,3=Wed,4=Thu,5=Fri,6=Sat
-  const weeklyLate = {
-    1: [3, 10],       // Mon: 李小華 late, 鄭雅琪 late
-    2: [5, 7],        // Tue: 陳志豪 late, 黃建國 late
-    3: [4, 9],        // Wed: 張美玲 late, 許志偉 late
-    4: [2, 6],        // Thu: 王大明 late, 林雅婷 late
-    5: [8, 3],        // Fri: 吳佳蓉 late, 李小華 late
-  };
-  const weeklyEarly = {
-    1: [7, 12],       // Mon: 黃建國 early, 周佩君 early
-    2: [4, 11],       // Tue: 張美玲 early, 蔡明翰 early
-    3: [6, 8],        // Wed: 林雅婷 early, 吳佳蓉 early
-    4: [5, 10],       // Thu: 陳志豪 early, 鄭雅琪 early
-    5: [2, 9],        // Fri: 王大明 early, 許志偉 early
-  };
-  // Late minutes per person per day (varies)
+  const weeklyLate = { 1:[3,10], 2:[5,7], 3:[4,9], 4:[2,6], 5:[8,3] };
+  const weeklyEarly = { 1:[7,12], 2:[4,11], 3:[6,8], 4:[5,10], 5:[2,9] };
   const lateMinPool = [12, 18, 7, 25, 15, 9, 22, 5, 30, 14, 8, 20];
   const earlyMinPool = [10, 15, 22, 8, 18, 12, 25, 6, 20, 14, 9, 17];
 
-  const dayOfWeek = now.getDay();
-  const dayOfMonth = now.getDate();
+  const dayOfWeek = now.getDay(), dayOfMonth = now.getDate();
   const todayLate = weeklyLate[dayOfWeek] || [];
   const todayEarly = weeklyEarly[dayOfWeek] || [];
 
-  const activeUsers = db.users.filter(u => u.status === 'active');
-  activeUsers.forEach(u => {
+  db.users.filter(u => u.status === 'active').forEach(u => {
     if (u.id === excludeUserId) return;
     if (db.attendance.find(a => a.userId === u.id && a.date === todayStr)) return;
 
-    const shift = uidShift[u.id] || 'morning';
+    const shift = UID_SHIFT_MAP[u.id] || 'morning';
     const cfg = shiftCfg[shift];
-    const shiftStartMin = cfg.startH * 60;
-    const shiftEndMin = cfg.endH * 60;
+    const shiftStartMin = cfg.startH * 60, shiftEndMin = cfg.endH * 60;
     const crossesMidnight = shiftEndMin < shiftStartMin;
 
-    // Only generate if current time is past shift start - 15min
-    if (crossesMidnight) {
-      if (nowMin < shiftStartMin - 15 && nowMin > shiftEndMin) return;
-    } else {
-      if (nowMin < shiftStartMin - 15) return;
-    }
+    if (crossesMidnight) { if (nowMin < shiftStartMin - 15 && nowMin > shiftEndMin) return; }
+    else { if (nowMin < shiftStartMin - 15) return; }
 
     const isLate = todayLate.includes(u.id);
     const isEarly = todayEarly.includes(u.id);
     let clockIn, clockOut = null, status = 'normal', lateMins = 0, earlyMins = 0;
 
-    // Clock in
     if (isLate) {
       lateMins = lateMinPool[(u.id + dayOfMonth) % lateMinPool.length];
-      const totalMin = cfg.startH * 60 + lateMins;
-      clockIn = `${String(Math.floor(totalMin/60)).padStart(2,'0')}:${String(totalMin%60).padStart(2,'0')}`;
+      clockIn = minToTime(cfg.startH * 60 + lateMins);
       status = 'late';
     } else {
-      const offset = ((u.id * 7 + dayOfMonth * 3) % 14) + 1; // 1~14 min early
-      const m = cfg.earlyBase * 60 + 60 - offset;
-      clockIn = `${String(Math.floor(m/60)).padStart(2,'0')}:${String(m%60).padStart(2,'0')}`;
+      const offset = ((u.id * 7 + dayOfMonth * 3) % 14) + 1;
+      clockIn = minToTime(cfg.earlyBase * 60 + 60 - offset);
     }
 
-    // Don't generate if clock-in time is in the future
     const [ciH, ciM] = clockIn.split(':').map(Number);
     if (ciH * 60 + ciM > nowMin) return;
 
-    // Clock out
-    const shiftEnded = crossesMidnight
-      ? (nowMin > shiftEndMin && nowMin < shiftStartMin)
-      : (nowMin > shiftEndMin);
-
+    const shiftEnded = crossesMidnight ? (nowMin > shiftEndMin && nowMin < shiftStartMin) : (nowMin > shiftEndMin);
     if (shiftEnded) {
       if (isEarly) {
         earlyMins = earlyMinPool[(u.id + dayOfMonth) % earlyMinPool.length];
-        const totalMin = cfg.endH * 60 - earlyMins;
-        clockOut = `${String(Math.floor(totalMin/60)).padStart(2,'0')}:${String(totalMin%60).padStart(2,'0')}`;
+        clockOut = minToTime(cfg.endH * 60 - earlyMins);
         status = status === 'late' ? 'late+early' : 'early';
       } else {
-        const extra = ((u.id * 3 + dayOfMonth) % 12) + 1;
-        clockOut = `${String(cfg.endH).padStart(2,'0')}:${String(extra).padStart(2,'0')}`;
+        clockOut = `${pad2(cfg.endH)}:${pad2(((u.id * 3 + dayOfMonth) % 12) + 1)}`;
       }
     }
 
-    db.attendance.push({
-      id: db.nextId.attendance++,
-      userId: u.id, date: todayStr, clockIn, clockOut, status,
-      lateMinutes: lateMins, earlyLeaveMinutes: earlyMins, shift
-    });
+    db.attendance.push({ id: db.nextId.attendance++, userId: u.id, date: todayStr, clockIn, clockOut, status, lateMinutes: lateMins, earlyLeaveMinutes: earlyMins, shift });
   });
 
   db.lastAttendanceDate = todayStr;
@@ -346,7 +272,7 @@ function ensureTodayAttendance(excludeUserId) {
 // ============================================================
 function fmtDate(d) {
   if (typeof d === 'string') return d;
-  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+  return `${d.getFullYear()}-${pad2(d.getMonth()+1)}-${pad2(d.getDate())}`;
 }
 function fmtDateTime(d) { return new Date(d).toLocaleString('zh-TW'); }
 function today() { return fmtDate(new Date()); }
@@ -354,6 +280,7 @@ function getUserName(id) { const u = db.users.find(u=>u.id===id); return u ? u.n
 function getDeptName(id) { const d = db.departments.find(d=>d.id===id); return d ? d.name : '未知'; }
 function isAdmin() { return currentUser && currentUser.role === 'admin'; }
 function isManager() { return currentUser && (currentUser.role === 'manager' || currentUser.role === 'admin'); }
+function getNowMin() { const n = new Date(); return n.getHours() * 60 + n.getMinutes(); }
 
 const shiftTimes = {
   morning:   { start:'09:00', end:'18:00', startH:9, startM:0, endH:18, endM:0, label:'早班' },
@@ -364,9 +291,12 @@ const shiftTimes = {
 function getUserShift(userId, dateStr) {
   const s = db.schedules.find(s => s.userId === userId && s.date === dateStr);
   if (s) return s.shiftType;
-  // Default shift by user ID
-  const defaultShifts = { 9:'afternoon', 10:'afternoon', 11:'night', 12:'night' };
-  return defaultShifts[userId] || 'morning';
+  return UID_SHIFT_MAP[userId] || 'morning';
+}
+
+function shiftEnded(cfg, nowMin) {
+  const endMin = cfg.endH * 60 + cfg.endM, startMin = cfg.startH * 60 + cfg.startM;
+  return (endMin < startMin) ? (nowMin > endMin && nowMin < startMin) : (nowMin > endMin);
 }
 
 function toast(msg, type='success') {
@@ -386,6 +316,18 @@ function showModal(title, bodyHtml, footerHtml='') {
 
 function closeModal() { document.getElementById('modalOverlay').classList.remove('show'); }
 
+function modalFooter(submitLabel, submitFn) {
+  return `<button class="btn btn-ghost" onclick="closeModal()">取消</button><button class="btn btn-primary" onclick="${submitFn}">${submitLabel}</button>`;
+}
+
+function statusBadgeHtml(status, label) { return `<span class="badge badge-${status}">${label}</span>`; }
+
+function approvalBadge(status) {
+  const map = { pending: ['pending','待審核'], approved: ['success','已核准'], rejected: ['danger','已拒絕'] };
+  const [cls, text] = map[status] || ['info', status];
+  return statusBadgeHtml(cls, text);
+}
+
 // ============================================================
 // AUTH
 // ============================================================
@@ -403,21 +345,17 @@ function doLogin() {
     currentUser = found;
     try { sessionStorage.setItem('hr_user_id', found.id); } catch(e) {};
     document.getElementById('loginPage').style.display = 'none';
-    document.getElementById('app').style.display = 'flex';
-    document.getElementById('app').style.width = '100%';
+    const appEl = document.getElementById('app');
+    appEl.style.display = 'flex';
+    appEl.style.width = '100%';
     document.getElementById('userName').textContent = found.name;
     document.getElementById('userRole').textContent = found.role === 'admin' ? '系統管理員' : found.role === 'manager' ? '部門主管' : '一般員工';
     document.getElementById('userAvatar').textContent = found.name[0];
-    if (found.role !== 'admin') {
-      document.querySelectorAll('.admin-only').forEach(el => el.style.display = 'none');
-    }
+    if (found.role !== 'admin') document.querySelectorAll('.admin-only').forEach(el => el.style.display = 'none');
     ensureTodayAttendance(found.id);
     startClock();
     navigate('clock');
-  } catch(e) {
-    console.error('Login error:', e);
-    alert('登入發生錯誤: ' + e.message);
-  }
+  } catch(e) { console.error('Login error:', e); alert('登入發生錯誤: ' + e.message); }
 }
 
 function doLogout() {
@@ -433,11 +371,7 @@ function autoLogin() {
     const uid = sessionStorage.getItem('hr_user_id');
     if (uid) {
       const found = db.users.find(u => u.id === parseInt(uid));
-      if (found) {
-        document.getElementById('loginUser').value = found.employeeId;
-        document.getElementById('loginPass').value = found.password;
-        doLogin();
-      }
+      if (found) { document.getElementById('loginUser').value = found.employeeId; document.getElementById('loginPass').value = found.password; doLogin(); }
     }
   } catch(e) {}
 }
@@ -468,10 +402,7 @@ function toggleSidebar() { document.getElementById('sidebar').classList.toggle('
 // ============================================================
 document.addEventListener('click', e => {
   const nav = e.target.closest('.nav-item[data-page]');
-  if (nav) {
-    navigate(nav.dataset.page);
-    document.getElementById('sidebar').classList.remove('open');
-  }
+  if (nav) { navigate(nav.dataset.page); document.getElementById('sidebar').classList.remove('open'); }
 });
 
 function navigate(page) {
@@ -487,79 +418,50 @@ function navigate(page) {
 function setBadge(id, count) {
   const el = document.getElementById(id);
   if (!el) return;
-  if (count === 0) {
-    el.className = '';
-    el.textContent = '';
-  } else if (count === 1) {
-    el.className = 'nav-badge dot';
-    el.textContent = '';
-  } else {
-    el.className = 'nav-badge';
-    el.textContent = count;
-  }
+  if (count === 0) { el.className = ''; el.textContent = ''; }
+  else if (count === 1) { el.className = 'nav-badge dot'; el.textContent = ''; }
+  else { el.className = 'nav-badge'; el.textContent = count; }
 }
 
 function updateBadges() {
   if (!currentUser) return;
+  const nowMin = getNowMin();
+  const todayStr = today();
 
-  // Clock: red dot if not clocked in (after shift start) or not clocked out (after shift end)
-  const myClock = db.attendance.find(a => a.userId === currentUser.id && a.date === today());
-  const myShift = getUserShift(currentUser.id, today());
+  // Clock badge
+  const myClock = db.attendance.find(a => a.userId === currentUser.id && a.date === todayStr);
+  const myShift = getUserShift(currentUser.id, todayStr);
   const myCfg = shiftTimes[myShift];
-  const nowTime = new Date();
-  const nowMinutes = nowTime.getHours() * 60 + nowTime.getMinutes();
   const myStartMin = myCfg.startH * 60 + myCfg.startM;
   const myEndMin = myCfg.endH * 60 + myCfg.endM;
   const myCrosses = myEndMin < myStartMin;
-  const myShiftEnded = myCrosses ? (nowMinutes > myEndMin && nowMinutes < myStartMin) : (nowMinutes > myEndMin);
+  const myShiftDone = myCrosses ? (nowMin > myEndMin && nowMin < myStartMin) : (nowMin > myEndMin);
   let clockBadge = 0;
-  if (!myClock && nowMinutes >= myStartMin) {
-    clockBadge = 1; // not clocked in, shift started
-  } else if (myClock && !myClock.clockOut && myShiftEnded) {
-    // Only show clock-out dot if they clocked in BEFORE shift end
+  if (!myClock && nowMin >= myStartMin) {
+    clockBadge = 1;
+  } else if (myClock && !myClock.clockOut && myShiftDone) {
     const [ciH, ciM] = myClock.clockIn.split(':').map(Number);
     const clockInMin = ciH * 60 + ciM;
-    const clockedInBeforeEnd = myCrosses
-      ? (clockInMin >= myStartMin || clockInMin <= myEndMin)
-      : (clockInMin <= myEndMin);
+    const clockedInBeforeEnd = myCrosses ? (clockInMin >= myStartMin || clockInMin <= myEndMin) : (clockInMin <= myEndMin);
     if (clockedInBeforeEnd) clockBadge = 1;
   }
   setBadge('badge-clock', clockBadge);
+  setBadge('badge-leave', isManager() ? db.leaves.filter(l => l.status === 'pending').length : 0);
+  setBadge('badge-overtime', isManager() ? db.overtime.filter(o => o.status === 'pending').length : 0);
+  setBadge('badge-announcements', db.announcements.filter(a => a.id > lastViewedAnnId).length);
 
-  // Leave: pending leave requests (for managers/admin)
-  const pendingLeaves = isManager() ? db.leaves.filter(l => l.status === 'pending').length : 0;
-  setBadge('badge-leave', pendingLeaves);
-
-  // Overtime: pending overtime requests (for managers/admin)
-  const pendingOT = isManager() ? db.overtime.filter(o => o.status === 'pending').length : 0;
-  setBadge('badge-overtime', pendingOT);
-
-  // Announcements: show badge for new announcements since last viewed
-  const newAnn = db.announcements.filter(a => a.id > lastViewedAnnId).length;
-  setBadge('badge-announcements', newAnn);
-
-  // Records: count of employees whose shift started but haven't clocked in (遲到中)
-  const todayStr = today();
   if (isManager()) {
-    const now = new Date();
-    const nowMin = now.getHours() * 60 + now.getMinutes();
-    const activeUsers = db.users.filter(u => u.status === 'active');
     let lateCount = 0;
-    activeUsers.forEach(u => {
-      const hasRecord = db.attendance.find(a => a.userId === u.id && a.date === todayStr);
-      if (!hasRecord) {
-        const shift = getUserShift(u.id, todayStr);
-        const cfg = shiftTimes[shift];
-        const startMin = cfg.startH * 60 + cfg.startM;
-        if (nowMin >= startMin) lateCount++;
+    db.users.filter(u => u.status === 'active').forEach(u => {
+      if (!db.attendance.find(a => a.userId === u.id && a.date === todayStr)) {
+        const cfg = shiftTimes[getUserShift(u.id, todayStr)];
+        if (nowMin >= cfg.startH * 60 + cfg.startM) lateCount++;
       }
     });
     setBadge('badge-records', lateCount);
   } else {
     setBadge('badge-records', 0);
   }
-
-  // Dashboard & Schedule: no badges
   setBadge('badge-dashboard', 0);
   setBadge('badge-schedule', 0);
 }
@@ -573,21 +475,19 @@ function renderDashboard() {
   const activeUsers = db.users.filter(u => u.status === 'active').length;
   const clockedIn = todayRecords.length;
   const lateCount = todayRecords.filter(a => a.status.includes('late')).length;
-  const pendingLeaves = db.leaves.filter(l => l.status === 'pending').length;
-  const pendingOT = db.overtime.filter(o => o.status === 'pending').length;
+  const pendingTotal = db.leaves.filter(l => l.status === 'pending').length + db.overtime.filter(o => o.status === 'pending').length;
 
   const myRecord = todayRecords.find(a => a.userId === currentUser.id);
   const myStatus = myRecord ? (myRecord.clockOut ? '已下班 ✓' : '已打卡上班') : '尚未打卡';
   const myStatusClass = myRecord ? (myRecord.clockOut ? 'badge-success' : 'badge-info') : 'badge-warning';
 
-  let html = `
+  document.getElementById('pageContent').innerHTML = `
     <div class="stats-grid">
       <div class="stat-card"><div class="stat-icon blue">👥</div><div class="stat-info"><div class="stat-value">${activeUsers}</div><div class="stat-label">在職員工</div></div></div>
       <div class="stat-card"><div class="stat-icon green">✅</div><div class="stat-info"><div class="stat-value">${clockedIn}</div><div class="stat-label">今日已打卡</div></div></div>
       <div class="stat-card"><div class="stat-icon yellow">⚠️</div><div class="stat-info"><div class="stat-value">${lateCount}</div><div class="stat-label">今日遲到</div></div></div>
-      <div class="stat-card"><div class="stat-icon red">📝</div><div class="stat-info"><div class="stat-value">${pendingLeaves + pendingOT}</div><div class="stat-label">待審核申請</div></div></div>
+      <div class="stat-card"><div class="stat-icon red">📝</div><div class="stat-info"><div class="stat-value">${pendingTotal}</div><div class="stat-label">待審核申請</div></div></div>
     </div>
-
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
       <div class="card">
         <div class="card-header"><h3>我的今日狀態</h3><span class="badge ${myStatusClass}">${myStatus}</span></div>
@@ -597,47 +497,32 @@ function renderDashboard() {
         </div>
         <div style="margin-top:16px"><button class="btn btn-primary btn-sm" onclick="navigate('clock')">前往打卡</button></div>
       </div>
-
       <div class="card">
         <div class="card-header"><h3>最新公告</h3></div>
         ${db.announcements.slice(0,2).map(a => `
           <div style="margin-bottom:12px">
             <div style="font-size:13px;font-weight:600">${a.pinned ? '📌 ' : ''}${a.title}</div>
             <div style="font-size:11px;color:var(--text-muted);margin-top:2px">${getUserName(a.authorId)} · ${a.createdAt.substring(0,10)}</div>
-          </div>
-        `).join('')}
+          </div>`).join('')}
         <button class="btn btn-ghost btn-sm" onclick="navigate('announcements')">查看全部</button>
       </div>
     </div>
-
     <div class="card" style="margin-top:16px">
       <div class="card-header"><h3>本月出勤趨勢</h3></div>
       ${renderAttendanceChart()}
-    </div>
-  `;
-  document.getElementById('pageContent').innerHTML = html;
+    </div>`;
 }
 
 function renderAttendanceChart() {
-  const now = new Date();
-  const year = now.getFullYear();
-  const month = now.getMonth();
-  const days = [];
+  const now = new Date(), year = now.getFullYear(), month = now.getMonth(), days = [];
   for (let d = 1; d <= now.getDate(); d++) {
     const date = new Date(year, month, d);
     if (date.getDay() === 0 || date.getDay() === 6) continue;
-    const dateStr = fmtDate(date);
-    const count = db.attendance.filter(a => a.date === dateStr).length;
-    days.push({ label: d, count });
+    days.push({ label: d, count: db.attendance.filter(a => a.date === fmtDate(date)).length });
   }
   const max = Math.max(...days.map(d => d.count), 1);
   return `<div class="chart-bar">${days.map(d => `
-    <div class="chart-col">
-      <div class="chart-value">${d.count}</div>
-      <div class="chart-bar-fill" style="height:${(d.count/max)*160}px;background:var(--accent)"></div>
-      <div class="chart-label">${d.label}</div>
-    </div>
-  `).join('')}</div>`;
+    <div class="chart-col"><div class="chart-value">${d.count}</div><div class="chart-bar-fill" style="height:${(d.count/max)*160}px;background:var(--accent)"></div><div class="chart-label">${d.label}</div></div>`).join('')}</div>`;
 }
 
 // ============================================================
@@ -646,69 +531,49 @@ function renderAttendanceChart() {
 function renderClock() {
   const todayStr = today();
   const myRecord = db.attendance.find(a => a.userId === currentUser.id && a.date === todayStr);
-  const hasClockedIn = !!myRecord;
-  const hasClockedOut = myRecord && myRecord.clockOut;
+  const hasClockedIn = !!myRecord, hasClockedOut = myRecord && myRecord.clockOut;
 
-  let statusHtml = '';
+  let statusHtml;
   if (!hasClockedIn) statusHtml = '<div class="clock-status"><span class="badge badge-warning">尚未打卡上班</span></div>';
   else if (!hasClockedOut) statusHtml = `<div class="clock-status"><span class="badge badge-info">已於 ${myRecord.clockIn} 打卡上班</span>${myRecord.status.includes('late') ? ` <span class="badge badge-danger">遲到 ${myRecord.lateMinutes} 分鐘</span>` : ''}</div>`;
   else statusHtml = `<div class="clock-status"><span class="badge badge-success">今日出勤完成 ${myRecord.clockIn} ~ ${myRecord.clockOut}</span></div>`;
 
+  const disabledAttr = 'disabled style="opacity:.4;cursor:not-allowed"';
   document.getElementById('pageContent').innerHTML = `
-    <div class="card">
-      <div class="clock-section">
-        <div class="live-clock" id="liveClock">00:00:00</div>
-        <div class="live-date" id="liveDate"></div>
-        <div class="clock-buttons">
-          <button class="btn btn-success btn-clock" onclick="doClockIn()" ${hasClockedIn ? 'disabled style="opacity:.4;cursor:not-allowed"' : ''}>☀️ 上班打卡</button>
-          <button class="btn btn-primary btn-clock" onclick="doClockOut()" ${!hasClockedIn || hasClockedOut ? 'disabled style="opacity:.4;cursor:not-allowed"' : ''}>🌙 下班打卡</button>
-        </div>
-        ${statusHtml}
+    <div class="card"><div class="clock-section">
+      <div class="live-clock" id="liveClock">00:00:00</div>
+      <div class="live-date" id="liveDate"></div>
+      <div class="clock-buttons">
+        <button class="btn btn-success btn-clock" onclick="doClockIn()" ${hasClockedIn ? disabledAttr : ''}>☀️ 上班打卡</button>
+        <button class="btn btn-primary btn-clock" onclick="doClockOut()" ${!hasClockedIn || hasClockedOut ? disabledAttr : ''}>🌙 下班打卡</button>
       </div>
-    </div>
-
+      ${statusHtml}
+    </div></div>
     <div class="card">
       <div class="card-header"><h3>本週打卡記錄</h3></div>
-      <div class="table-wrap">
-        <table>
-          <thead><tr><th>日期</th><th>上班</th><th>下班</th><th>狀態</th></tr></thead>
-          <tbody>
-            ${getWeekRecords().map(r => `<tr>
-              <td>${r.date}</td>
-              <td style="color:${r.lateMinutes?'var(--danger)':r.clockIn?'var(--success)':'var(--text-muted)'};font-weight:600">${r.clockIn || '--'}</td>
-              <td style="color:${r.earlyLeaveMinutes?'var(--warning)':r.clockOut?'var(--success)':'var(--text-muted)'};font-weight:600">${r.clockOut || '--'}</td>
-              <td>${statusBadge(r.status)}</td>
-            </tr>`).join('')}
-          </tbody>
-        </table>
-      </div>
-    </div>
-  `;
+      <div class="table-wrap"><table>
+        <thead><tr><th>日期</th><th>上班</th><th>下班</th><th>狀態</th></tr></thead>
+        <tbody>${getWeekRecords().map(r => `<tr>
+          <td>${r.date}</td>
+          <td style="color:${r.lateMinutes?'var(--danger)':r.clockIn?'var(--success)':'var(--text-muted)'};font-weight:600">${r.clockIn || '--'}</td>
+          <td style="color:${r.earlyLeaveMinutes?'var(--warning)':r.clockOut?'var(--success)':'var(--text-muted)'};font-weight:600">${r.clockOut || '--'}</td>
+          <td>${statusBadge(r.status)}</td>
+        </tr>`).join('')}</tbody>
+      </table></div>
+    </div>`;
 }
 
 function doClockIn() {
   const now = new Date();
-  const timeStr = `${String(now.getHours()).padStart(2,'0')}:${String(now.getMinutes()).padStart(2,'0')}`;
+  const timeStr = `${pad2(now.getHours())}:${pad2(now.getMinutes())}`;
   const shift = getUserShift(currentUser.id, today());
   const cfg = shiftTimes[shift];
-  const graceMinutes = db.settings.lateGrace || 0;
-  const workStartMin = cfg.startH * 60 + cfg.startM + graceMinutes;
+  const workStartMin = cfg.startH * 60 + cfg.startM + (db.settings.lateGrace || 0);
   const nowMin = now.getHours() * 60 + now.getMinutes();
   const isLate = nowMin > workStartMin;
   const lateMins = isLate ? nowMin - (cfg.startH * 60 + cfg.startM) : 0;
 
-  const record = {
-    id: db.nextId.attendance++,
-    userId: currentUser.id,
-    date: today(),
-    clockIn: timeStr,
-    clockOut: null,
-    status: isLate ? 'late' : 'normal',
-    lateMinutes: lateMins,
-    earlyLeaveMinutes: 0,
-    shift: shift
-  };
-  db.attendance.push(record);
+  db.attendance.push({ id: db.nextId.attendance++, userId: currentUser.id, date: today(), clockIn: timeStr, clockOut: null, status: isLate ? 'late' : 'normal', lateMinutes: lateMins, earlyLeaveMinutes: 0, shift });
   saveDB(db);
   toast(isLate ? `上班打卡成功（遲到 ${lateMins} 分鐘）` : `上班打卡成功！(${cfg.label})`, isLate ? 'error' : 'success');
   renderClock();
@@ -717,15 +582,13 @@ function doClockIn() {
 
 function doClockOut() {
   const now = new Date();
-  const timeStr = `${String(now.getHours()).padStart(2,'0')}:${String(now.getMinutes()).padStart(2,'0')}`;
+  const timeStr = `${pad2(now.getHours())}:${pad2(now.getMinutes())}`;
   const record = db.attendance.find(a => a.userId === currentUser.id && a.date === today());
   if (!record) return;
-  const shift = record.shift || getUserShift(currentUser.id, today());
-  const cfg = shiftTimes[shift];
-  const workEndMin = cfg.endH * 60 + cfg.endM;
+  const cfg = shiftTimes[record.shift || getUserShift(currentUser.id, today())];
   const nowMin = now.getHours() * 60 + now.getMinutes();
-  const isEarly = nowMin < workEndMin;
-  const earlyMins = isEarly ? workEndMin - nowMin : 0;
+  const isEarly = nowMin < cfg.endH * 60 + cfg.endM;
+  const earlyMins = isEarly ? cfg.endH * 60 + cfg.endM - nowMin : 0;
 
   record.clockOut = timeStr;
   record.earlyLeaveMinutes = earlyMins;
@@ -737,17 +600,13 @@ function doClockOut() {
 }
 
 function getWeekRecords() {
-  const now = new Date();
-  const dayOfWeek = now.getDay();
-  const monday = new Date(now);
-  monday.setDate(now.getDate() - (dayOfWeek === 0 ? 6 : dayOfWeek - 1));
-  const records = [];
-  const todayStr = today();
+  const now = new Date(), monday = new Date(now);
+  monday.setDate(now.getDate() - (now.getDay() === 0 ? 6 : now.getDay() - 1));
+  const records = [], todayStr = today();
   for (let i = 0; i < 5; i++) {
-    const d = new Date(monday);
-    d.setDate(monday.getDate() + i);
+    const d = new Date(monday); d.setDate(monday.getDate() + i);
     const dateStr = fmtDate(d);
-    if (dateStr > todayStr) break; // don't show future days
+    if (dateStr > todayStr) break;
     const rec = db.attendance.find(a => a.userId === currentUser.id && a.date === dateStr);
     records.push(rec || { date: dateStr, clockIn: null, clockOut: null, status: 'absent' });
   }
@@ -755,8 +614,10 @@ function getWeekRecords() {
 }
 
 function statusBadge(s) {
-  const map = { normal:'<span class="badge badge-success">正常</span>', late:'<span class="badge badge-danger">遲到</span>', early:'<span class="badge badge-warning">早退</span>', 'late+early':'<span class="badge badge-danger">遲到+早退</span>', absent:'<span class="badge badge-danger">缺勤</span>', future:'<span class="badge badge-info">--</span>' };
-  return map[s] || `<span class="badge badge-info">${s}</span>`;
+  const map = { normal:'badge-success:正常', late:'badge-danger:遲到', early:'badge-warning:早退', 'late+early':'badge-danger:遲到+早退', absent:'badge-danger:缺勤', future:'badge-info:--' };
+  const entry = map[s];
+  if (entry) { const [cls, text] = entry.split(':'); return statusBadgeHtml(cls, text); }
+  return statusBadgeHtml('info', s);
 }
 
 // ============================================================
@@ -768,7 +629,6 @@ function renderRecords() {
     <div id="shiftMorning" class="card"></div>
     <div id="shiftAfternoon" class="card"></div>
     <div id="shiftNight" class="card"></div>
-
     <div style="text-align:center;margin:20px 0">
       <button class="btn btn-ghost" onclick="toggleYesterday()" id="yesterdayBtn">📋 查看昨日出勤記錄</button>
     </div>
@@ -778,7 +638,6 @@ function renderRecords() {
       <div id="yShiftAfternoon" class="card"></div>
       <div id="yShiftNight" class="card"></div>
     </div>
-
     <div class="card" style="margin-top:20px">
       <div class="card-header"><h3>📆 歷史出勤查詢</h3></div>
       <div class="filter-bar">
@@ -791,84 +650,51 @@ function renderRecords() {
       <div id="hShiftMorning" class="card"></div>
       <div id="hShiftAfternoon" class="card"></div>
       <div id="hShiftNight" class="card"></div>
-    </div>
-  `;
+    </div>`;
   filterRecords();
 }
 
+function getRecordShift(r) { return r.shift || getUserShift(r.userId, r.date); }
+
 function isOvertimeNow(r) {
   if (r.clockOut || r.date !== today() || !r.clockIn) return false;
-  const shift = getRecordShift(r);
-  const cfg = shiftTimes[shift];
-  const now = new Date();
-  const nowMin = now.getHours() * 60 + now.getMinutes();
-  const startMin = cfg.startH * 60 + cfg.startM;
-  const endMin = cfg.endH * 60 + cfg.endM;
-  const crossesMidnight = endMin < startMin;
-  return crossesMidnight ? (nowMin > endMin && nowMin < startMin) : (nowMin > endMin);
-}
-
-function getRecordShift(r) {
-  if (r.shift) return r.shift;
-  return getUserShift(r.userId, r.date);
+  return shiftEnded(shiftTimes[getRecordShift(r)], getNowMin());
 }
 
 function shiftStartedToday(r) {
   if (r.date !== today()) return true;
-  const shift = getRecordShift(r);
-  const cfg = shiftTimes[shift];
-  const now = new Date();
-  const nowMin = now.getHours() * 60 + now.getMinutes();
-  // For overnight shifts: if now is before end time (e.g. 00:30 < 06:00), the shift from yesterday is ongoing
+  const cfg = shiftTimes[getRecordShift(r)];
+  const nowMin = getNowMin();
   const crossesMidnight = cfg.endH < cfg.startH;
-  if (crossesMidnight && nowMin < cfg.endH * 60 + cfg.endM) return false; // yesterday's shift still going, today's hasn't started
+  if (crossesMidnight && nowMin < cfg.endH * 60 + cfg.endM) return false;
   return nowMin >= cfg.startH * 60 + cfg.startM;
 }
 
-// Check if a night shift worker from yesterday is still working now (past midnight)
-function getOvernightRecord(userId) {
-  const now = new Date();
-  const nowMin = now.getHours() * 60 + now.getMinutes();
-  const shift = getUserShift(userId, today());
-  const cfg = shiftTimes[shift];
-  const crossesMidnight = cfg.endH < cfg.startH;
-  if (!crossesMidnight || nowMin >= cfg.endH * 60 + cfg.endM) return null;
-  // Check yesterday's record
-  const yesterday = new Date(now);
-  yesterday.setDate(now.getDate() - 1);
-  const yd = fmtDate(yesterday);
-  const yRecord = db.attendance.find(a => a.userId === userId && a.date === yd && !a.clockOut);
-  return yRecord;
-}
-
-// Check if a night shift worker from yesterday is currently working (past midnight, before shift end)
 function isOvernightWorking(r) {
   if (r.date !== today() || r.clockIn || r.clockOut) return false;
-  const shift = getRecordShift(r);
-  const cfg = shiftTimes[shift];
-  if (cfg.endH >= cfg.startH) return false; // not an overnight shift
-  const now = new Date();
-  const nowMin = now.getHours() * 60 + now.getMinutes();
-  if (nowMin >= cfg.endH * 60 + cfg.endM) return false; // past shift end
-  // Check if yesterday has a clock-in record for this user's night shift
-  const yesterday = new Date(now);
-  yesterday.setDate(now.getDate() - 1);
-  const yd = fmtDate(yesterday);
-  const yRec = db.attendance.find(a => a.userId === r.userId && a.date === yd);
+  const cfg = shiftTimes[getRecordShift(r)];
+  if (cfg.endH >= cfg.startH) return false;
+  const nowMin = getNowMin();
+  if (nowMin >= cfg.endH * 60 + cfg.endM) return false;
+  const yesterday = new Date(); yesterday.setDate(yesterday.getDate() - 1);
+  const yRec = db.attendance.find(a => a.userId === r.userId && a.date === fmtDate(yesterday));
   return !!(yRec && yRec.clockIn);
 }
 
 function todayClockInLabel(r) {
   if (r.clockIn) return r.clockIn;
-  if (isOvernightWorking(r)) { const yd = fmtDate(new Date(new Date().setDate(new Date().getDate()-1))); const yr = db.attendance.find(a=>a.userId===r.userId&&a.date===yd); return yr ? yr.clockIn : '工作中~'; }
+  if (isOvernightWorking(r)) {
+    const yd = fmtDate(new Date(new Date().setDate(new Date().getDate()-1)));
+    const yr = db.attendance.find(a=>a.userId===r.userId&&a.date===yd);
+    return yr ? yr.clockIn : '工作中~';
+  }
   if (r.date !== today()) return '缺曠';
   return shiftStartedToday(r) ? '遲到中~' : '待上班';
 }
 
 function todayClockInColor(r) {
   if (r.lateMinutes) return 'var(--danger)';
-  if (r.clockIn) return 'var(--success)';
-  if (isOvernightWorking(r)) return 'var(--success)';
+  if (r.clockIn || isOvernightWorking(r)) return 'var(--success)';
   if (r.date !== today()) return 'var(--danger)';
   return shiftStartedToday(r) ? 'var(--danger)' : 'var(--text-muted)';
 }
@@ -891,8 +717,8 @@ function todayClockOutColor(r) {
 }
 
 function todayStatusBadge(r) {
-  if (isOvernightWorking(r)) return '<span class="badge badge-info">工作中</span>';
-  if (r.date === today() && !r.clockIn && !shiftStartedToday(r)) return '<span class="badge badge-info">待上班</span>';
+  if (isOvernightWorking(r)) return statusBadgeHtml('info', '工作中');
+  if (r.date === today() && !r.clockIn && !shiftStartedToday(r)) return statusBadgeHtml('info', '待上班');
   return statusBadge(r.status);
 }
 
@@ -909,28 +735,21 @@ function buildRecordRows(records) {
 }
 
 function renderShiftSection(containerId, title, timeRange, color, records) {
+  const tableHeader = `<th>日期</th>${isAdmin() ? '<th>員工</th>' : ''}<th>上班</th><th>下班</th><th>狀態</th><th>遲到(分)</th><th>早退(分)</th>`;
   document.getElementById(containerId).innerHTML = `
     <div class="card-header">
       <h3><span style="color:${color}">● </span>${title} <span style="font-size:12px;color:var(--text-muted);font-weight:400">${timeRange}</span> <span style="font-size:12px;color:var(--text-muted);font-weight:400">(${records.length} 筆)</span></h3>
     </div>
-    ${records.length ? `<div class="table-wrap"><table>
-      <thead><tr><th>日期</th>${isAdmin() ? '<th>員工</th>' : ''}<th>上班</th><th>下班</th><th>狀態</th><th>遲到(分)</th><th>早退(分)</th></tr></thead>
-      <tbody>${buildRecordRows(records)}</tbody>
-    </table></div>` : '<div class="empty-state"><div class="icon">📭</div>此班別無出勤記錄</div>'}
-  `;
+    ${records.length ? `<div class="table-wrap"><table><thead><tr>${tableHeader}</tr></thead><tbody>${buildRecordRows(records)}</tbody></table></div>` : '<div class="empty-state"><div class="icon">📭</div>此班別無出勤記錄</div>'}`;
 }
 
-function filterRecords() {
-  renderRecordsForDate(today(), 'shiftMorning', 'shiftAfternoon', 'shiftNight');
-}
+function filterRecords() { renderRecordsForDate(today(), 'shiftMorning', 'shiftAfternoon', 'shiftNight'); }
 
 function renderRecordsForDate(dateStr, mId, aId, nId) {
   let records = db.attendance.filter(a => a.date === dateStr);
-  const targetUsers = db.users.filter(u => u.status === 'active');
-  targetUsers.forEach(u => {
+  db.users.filter(u => u.status === 'active').forEach(u => {
     if (!records.find(r => r.userId === u.id && r.date === dateStr)) {
-      const shift = getUserShift(u.id, dateStr);
-      records.push({ userId: u.id, date: dateStr, clockIn: null, clockOut: null, status: 'absent', lateMinutes: 0, earlyLeaveMinutes: 0, shift });
+      records.push({ userId: u.id, date: dateStr, clockIn: null, clockOut: null, status: 'absent', lateMinutes: 0, earlyLeaveMinutes: 0, shift: getUserShift(u.id, dateStr) });
     }
   });
   records.sort((a, b) => a.userId - b.userId);
@@ -940,9 +759,7 @@ function renderRecordsForDate(dateStr, mId, aId, nId) {
 }
 
 function getYesterdayWorkday() {
-  const now = new Date();
-  let d = new Date(now);
-  d.setDate(d.getDate() - 1);
+  let d = new Date(); d.setDate(d.getDate() - 1);
   while (d.getDay() === 0 || d.getDay() === 6) d.setDate(d.getDate() - 1);
   return fmtDate(d);
 }
@@ -977,9 +794,7 @@ function loadHistoryRecords() {
 function renderLeave() {
   const myBalances = db.leaveBalances.filter(b => b.userId === currentUser.id);
   const showAll = isManager();
-  let leaves = showAll
-    ? db.leaves.slice().sort((a,b) => b.id - a.id)
-    : db.leaves.filter(l => l.userId === currentUser.id).sort((a,b) => b.id - a.id);
+  const leaves = (showAll ? db.leaves.slice() : db.leaves.filter(l => l.userId === currentUser.id)).sort((a,b) => b.id - a.id);
 
   document.getElementById('pageContent').innerHTML = `
     <div class="card">
@@ -990,11 +805,9 @@ function renderLeave() {
             <div style="font-size:12px;color:var(--text-muted)">${b.leaveType}</div>
             <div style="font-size:22px;font-weight:700;margin:4px 0">${b.totalDays - b.usedDays}</div>
             <div style="font-size:11px;color:var(--text-muted)">剩餘 / 共${b.totalDays}天</div>
-          </div>
-        `).join('')}
+          </div>`).join('')}
       </div>
     </div>
-
     <div class="card">
       <div class="card-header"><h3>${showAll ? '所有請假申請' : '我的請假記錄'}</h3></div>
       ${showAll ? `<div class="tabs" id="leaveTabs">
@@ -1005,24 +818,19 @@ function renderLeave() {
       </div>` : ''}
       <div class="table-wrap"><table>
         <thead><tr>${showAll ? '<th>申請人</th>' : ''}<th>假別</th><th>開始</th><th>結束</th><th>原因</th><th>狀態</th>${showAll ? '<th>操作</th>' : ''}</tr></thead>
-        <tbody id="leaveTableBody">
-          ${leaves.map(l => leaveRow(l, showAll)).join('')}
-        </tbody>
+        <tbody id="leaveTableBody">${leaves.map(l => leaveRow(l, showAll)).join('')}</tbody>
       </table></div>
-    </div>
-  `;
+    </div>`;
 }
 
 function leaveRow(l, showAll) {
-  const sBadge = l.status === 'pending' ? 'badge-pending' : l.status === 'approved' ? 'badge-success' : 'badge-danger';
-  const sText = l.status === 'pending' ? '待審核' : l.status === 'approved' ? '已核准' : '已拒絕';
   return `<tr data-status="${l.status}">
     ${showAll ? `<td>${getUserName(l.userId)}</td>` : ''}
     <td>${l.type}</td><td>${l.startDate}</td><td>${l.endDate}</td><td>${l.reason}</td>
-    <td><span class="badge ${sBadge}">${sText}</span></td>
+    <td>${approvalBadge(l.status)}</td>
     ${showAll && l.status === 'pending' ? `<td>
-      <button class="btn btn-success btn-sm" onclick="approveLeave(${l.id})">核准</button>
-      <button class="btn btn-danger btn-sm" onclick="rejectLeave(${l.id})">拒絕</button>
+      <button class="btn btn-success btn-sm" onclick="handleLeave(${l.id},'approved')">核准</button>
+      <button class="btn btn-danger btn-sm" onclick="handleLeave(${l.id},'rejected')">拒絕</button>
     </td>` : showAll ? '<td>--</td>' : ''}
   </tr>`;
 }
@@ -1045,7 +853,7 @@ function showLeaveForm() {
       <div class="form-group"><label>結束日期</label><input type="date" class="form-control" id="leaveEnd" value="${today()}"></div>
     </div>
     <div class="form-group"><label>請假原因</label><textarea class="form-control" id="leaveReason" placeholder="請輸入請假原因"></textarea></div>
-  `, `<button class="btn btn-ghost" onclick="closeModal()">取消</button><button class="btn btn-primary" onclick="submitLeave()">送出申請</button>`);
+  `, modalFooter('送出申請', 'submitLeave()'));
 }
 
 function submitLeave() {
@@ -1056,36 +864,22 @@ function submitLeave() {
   if (!start || !end || !reason) { toast('請填寫完整資訊','error'); return; }
   if (end < start) { toast('結束日期不可早於開始日期','error'); return; }
   db.leaves.push({ id: db.nextId.leaves++, userId: currentUser.id, type, startDate: start, endDate: end, reason, status:'pending', approvedBy:null, createdAt: today() });
-  saveDB(db);
-  closeModal();
-  toast('請假申請已送出');
-  renderLeave();
+  saveDB(db); closeModal(); toast('請假申請已送出'); renderLeave();
 }
 
-function approveLeave(id) {
+function handleLeave(id, newStatus) {
   const l = db.leaves.find(l => l.id === id);
   if (!l) return;
-  l.status = 'approved';
+  l.status = newStatus;
   l.approvedBy = currentUser.id;
-  // Update balance
-  const days = Math.ceil((new Date(l.endDate) - new Date(l.startDate)) / 86400000) + 1;
-  const bal = db.leaveBalances.find(b => b.userId === l.userId && b.leaveType === l.type);
-  if (bal) bal.usedDays += days;
+  if (newStatus === 'approved') {
+    const days = Math.ceil((new Date(l.endDate) - new Date(l.startDate)) / 86400000) + 1;
+    const bal = db.leaveBalances.find(b => b.userId === l.userId && b.leaveType === l.type);
+    if (bal) bal.usedDays += days;
+  }
   saveDB(db);
-  toast('已核准請假');
-  renderLeave();
-  updateBadges();
-}
-
-function rejectLeave(id) {
-  const l = db.leaves.find(l => l.id === id);
-  if (!l) return;
-  l.status = 'rejected';
-  l.approvedBy = currentUser.id;
-  saveDB(db);
-  toast('已拒絕請假', 'error');
-  renderLeave();
-  updateBadges();
+  toast(newStatus === 'approved' ? '已核准請假' : '已拒絕請假', newStatus === 'approved' ? 'success' : 'error');
+  renderLeave(); updateBadges();
 }
 
 // ============================================================
@@ -1093,31 +887,24 @@ function rejectLeave(id) {
 // ============================================================
 function renderOvertime() {
   const showAll = isManager();
-  let ots = showAll
-    ? db.overtime.slice().sort((a,b) => b.id - a.id)
-    : db.overtime.filter(o => o.userId === currentUser.id).sort((a,b) => b.id - a.id);
+  const ots = (showAll ? db.overtime.slice() : db.overtime.filter(o => o.userId === currentUser.id)).sort((a,b) => b.id - a.id);
 
   document.getElementById('pageContent').innerHTML = `
     <div class="card">
       <div class="card-header"><h3>${showAll ? '加班申請管理' : '我的加班記錄'}</h3><button class="btn btn-primary btn-sm" onclick="showOvertimeForm()">＋ 申請加班</button></div>
       <div class="table-wrap"><table>
         <thead><tr>${showAll?'<th>申請人</th>':''}<th>日期</th><th>時數</th><th>原因</th><th>狀態</th>${showAll?'<th>操作</th>':''}</tr></thead>
-        <tbody>${ots.map(o => {
-          const sBadge = o.status==='pending'?'badge-pending':o.status==='approved'?'badge-success':'badge-danger';
-          const sText = o.status==='pending'?'待審核':o.status==='approved'?'已核准':'已拒絕';
-          return `<tr>
-            ${showAll?`<td>${getUserName(o.userId)}</td>`:''}
-            <td>${o.date}</td><td>${o.hours} 小時</td><td>${o.reason}</td>
-            <td><span class="badge ${sBadge}">${sText}</span></td>
-            ${showAll && o.status==='pending' ? `<td>
-              <button class="btn btn-success btn-sm" onclick="approveOT(${o.id})">核准</button>
-              <button class="btn btn-danger btn-sm" onclick="rejectOT(${o.id})">拒絕</button>
-            </td>` : showAll ? '<td>--</td>' : ''}
-          </tr>`;
-        }).join('')}</tbody>
+        <tbody>${ots.map(o => `<tr>
+          ${showAll?`<td>${getUserName(o.userId)}</td>`:''}
+          <td>${o.date}</td><td>${o.hours} 小時</td><td>${o.reason}</td>
+          <td>${approvalBadge(o.status)}</td>
+          ${showAll && o.status==='pending' ? `<td>
+            <button class="btn btn-success btn-sm" onclick="handleOT(${o.id},'approved')">核准</button>
+            <button class="btn btn-danger btn-sm" onclick="handleOT(${o.id},'rejected')">拒絕</button>
+          </td>` : showAll ? '<td>--</td>' : ''}
+        </tr>`).join('')}</tbody>
       </table></div>
-    </div>
-  `;
+    </div>`;
 }
 
 function showOvertimeForm() {
@@ -1127,7 +914,7 @@ function showOvertimeForm() {
       <div class="form-group"><label>加班時數</label><input type="number" class="form-control" id="otHours" min="0.5" max="8" step="0.5" value="1"></div>
     </div>
     <div class="form-group"><label>加班原因</label><textarea class="form-control" id="otReason" placeholder="請輸入加班原因"></textarea></div>
-  `, `<button class="btn btn-ghost" onclick="closeModal()">取消</button><button class="btn btn-primary" onclick="submitOT()">送出申請</button>`);
+  `, modalFooter('送出申請', 'submitOT()'));
 }
 
 function submitOT() {
@@ -1136,24 +923,16 @@ function submitOT() {
   const reason = document.getElementById('otReason').value.trim();
   if (!date || !hours || !reason) { toast('請填寫完整資訊','error'); return; }
   db.overtime.push({ id: db.nextId.overtime++, userId: currentUser.id, date, hours, reason, status:'pending', approvedBy:null });
+  saveDB(db); closeModal(); toast('加班申請已送出'); renderOvertime();
+}
+
+function handleOT(id, newStatus) {
+  const o = db.overtime.find(o => o.id === id);
+  if (!o) return;
+  o.status = newStatus; o.approvedBy = currentUser.id;
   saveDB(db);
-  closeModal();
-  toast('加班申請已送出');
-  renderOvertime();
-}
-
-function approveOT(id) {
-  const o = db.overtime.find(o => o.id === id);
-  if (!o) return;
-  o.status = 'approved'; o.approvedBy = currentUser.id;
-  saveDB(db); toast('已核准加班'); renderOvertime(); updateBadges();
-}
-
-function rejectOT(id) {
-  const o = db.overtime.find(o => o.id === id);
-  if (!o) return;
-  o.status = 'rejected'; o.approvedBy = currentUser.id;
-  saveDB(db); toast('已拒絕加班', 'error'); renderOvertime(); updateBadges();
+  toast(newStatus === 'approved' ? '已核准加班' : '已拒絕加班', newStatus === 'approved' ? 'success' : 'error');
+  renderOvertime(); updateBadges();
 }
 
 // ============================================================
@@ -1161,23 +940,14 @@ function rejectOT(id) {
 // ============================================================
 function renderSchedule() {
   const now = new Date();
-  const year = now.getFullYear();
-  const month = now.getMonth();
-  const firstDay = new Date(year, month, 1);
-  const daysInMonth = new Date(year, month + 1, 0).getDate();
-  const startDay = firstDay.getDay();
-
-  // Generate week view for current week
   const weekStart = new Date(now);
   weekStart.setDate(now.getDate() - (now.getDay() === 0 ? 6 : now.getDay() - 1));
   const weekDays = [];
-  for (let i = 0; i < 7; i++) {
-    const d = new Date(weekStart);
-    d.setDate(weekStart.getDate() + i);
-    weekDays.push(d);
-  }
+  for (let i = 0; i < 7; i++) { const d = new Date(weekStart); d.setDate(weekStart.getDate() + i); weekDays.push(d); }
 
   const activeUsers = db.users.filter(u => u.status === 'active');
+  const shiftLabels = { morning:'早班<br><small style="opacity:.7">08:00-16:00</small>', afternoon:'中班<br><small style="opacity:.7">14:00-22:00</small>', night:'晚班<br><small style="opacity:.7">22:00-06:00</small>', off:'休假' };
+  const shiftCls = { morning:'shift-morning', afternoon:'shift-afternoon', night:'shift-night', off:'shift-off' };
 
   document.getElementById('pageContent').innerHTML = `
     <div class="card">
@@ -1191,16 +961,12 @@ function renderSchedule() {
           ${weekDays.map(d => {
             const dateStr = fmtDate(d);
             const s = db.schedules.find(s => s.userId === u.id && s.date === dateStr);
-            const isWeekend = d.getDay() === 0 || d.getDay() === 6;
-            const shift = s ? s.shiftType : (isWeekend ? 'off' : 'morning');
-            const labels = { morning:'早班<br><small style="opacity:.7">08:00-16:00</small>', afternoon:'中班<br><small style="opacity:.7">14:00-22:00</small>', night:'晚班<br><small style="opacity:.7">22:00-06:00</small>', off:'休假' };
-            const cls = { morning:'shift-morning', afternoon:'shift-afternoon', night:'shift-night', off:'shift-off' };
-            return `<td><span class="shift ${cls[shift]}">${labels[shift]}</span></td>`;
+            const shift = s ? s.shiftType : ((d.getDay() === 0 || d.getDay() === 6) ? 'off' : 'morning');
+            return `<td><span class="shift ${shiftCls[shift]}">${shiftLabels[shift]}</span></td>`;
           }).join('')}
         </tr>`).join('')}</tbody>
       </table></div>
-    </div>
-  `;
+    </div>`;
 }
 
 function showScheduleForm() {
@@ -1214,7 +980,7 @@ function showScheduleForm() {
       <option value="night">晚班 (22:00-06:00)</option>
       <option value="off">休假</option>
     </select></div>
-  `, `<button class="btn btn-ghost" onclick="closeModal()">取消</button><button class="btn btn-primary" onclick="submitSchedule()">儲存</button>`);
+  `, modalFooter('儲存', 'submitSchedule()'));
 }
 
 function submitSchedule() {
@@ -1224,19 +990,14 @@ function submitSchedule() {
   const existing = db.schedules.findIndex(s => s.userId === userId && s.date === date);
   if (existing >= 0) db.schedules[existing].shiftType = shiftType;
   else db.schedules.push({ id: db.nextId.schedules++, userId, date, shiftType });
-  saveDB(db);
-  closeModal();
-  toast('排班已更新');
-  renderSchedule();
+  saveDB(db); closeModal(); toast('排班已更新'); renderSchedule();
 }
 
 // ============================================================
 // ANNOUNCEMENTS
 // ============================================================
 function renderAnnouncements() {
-  // Save current threshold before updating, so NEW tags render first
   const prevViewedId = lastViewedAnnId;
-
   const sorted = db.announcements.slice().sort((a,b) => {
     if (a.pinned !== b.pinned) return b.pinned ? 1 : -1;
     return b.createdAt.localeCompare(a.createdAt);
@@ -1251,11 +1012,8 @@ function renderAnnouncements() {
           <h4>${a.pinned ? '📌 ' : ''}${a.id > prevViewedId ? '<span class="ann-new">NEW!!!</span> ' : ''}${a.title}${isAdmin() ? ` <button class="btn btn-ghost btn-sm" style="float:right" onclick="deleteAnnouncement(${a.id})">刪除</button>` : ''}</h4>
           <div class="meta">${getUserName(a.authorId)} · ${a.createdAt.substring(0,10)}</div>
           <p>${a.content}</p>
-        </div>
-      `).join('')}
-    </div>
-  `;
-  // Now mark as viewed and clear badge
+        </div>`).join('')}
+    </div>`;
   lastViewedAnnId = db.announcements.reduce((m, a) => Math.max(m, a.id), 0);
   updateBadges();
 }
@@ -1265,7 +1023,7 @@ function showAnnouncementForm() {
     <div class="form-group"><label>標題</label><input type="text" class="form-control" id="annTitle" placeholder="公告標題"></div>
     <div class="form-group"><label>內容</label><textarea class="form-control" id="annContent" rows="5" placeholder="公告內容"></textarea></div>
     <div class="form-group"><label><input type="checkbox" id="annPinned"> 置頂公告</label></div>
-  `, `<button class="btn btn-ghost" onclick="closeModal()">取消</button><button class="btn btn-primary" onclick="submitAnnouncement()">發布</button>`);
+  `, modalFooter('發布', 'submitAnnouncement()'));
 }
 
 function submitAnnouncement() {
@@ -1274,17 +1032,12 @@ function submitAnnouncement() {
   const pinned = document.getElementById('annPinned').checked;
   if (!title || !content) { toast('請填寫完整資訊','error'); return; }
   db.announcements.push({ id: db.nextId.announcements++, title, content, authorId: currentUser.id, createdAt: new Date().toISOString(), pinned });
-  saveDB(db);
-  closeModal();
-  toast('公告已發布');
-  renderAnnouncements();
+  saveDB(db); closeModal(); toast('公告已發布'); renderAnnouncements();
 }
 
 function deleteAnnouncement(id) {
   db.announcements = db.announcements.filter(a => a.id !== id);
-  saveDB(db);
-  toast('公告已刪除');
-  renderAnnouncements();
+  saveDB(db); toast('公告已刪除'); renderAnnouncements();
 }
 
 // ============================================================
@@ -1292,6 +1045,7 @@ function deleteAnnouncement(id) {
 // ============================================================
 function renderEmployees() {
   const users = db.users.slice().sort((a,b) => a.id - b.id);
+  const roleLabel = r => r === 'admin' ? '管理員' : r === 'manager' ? '主管' : '員工';
   document.getElementById('pageContent').innerHTML = `
     <div class="card">
       <div class="card-header"><h3>員工列表 (${users.length} 人)</h3>
@@ -1303,23 +1057,23 @@ function renderEmployees() {
           <td>${u.employeeId}</td>
           <td style="font-weight:600">${u.name}</td>
           <td>${getDeptName(u.departmentId)}</td>
-          <td>${u.role === 'admin' ? '管理員' : u.role === 'manager' ? '主管' : '員工'}</td>
+          <td>${roleLabel(u.role)}</td>
           <td>${u.email}</td>
           <td>${u.hireDate}</td>
-          <td><span class="badge ${u.status==='active'?'badge-success':'badge-danger'}">${u.status==='active'?'在職':'停用'}</span></td>
+          <td>${statusBadgeHtml(u.status==='active'?'success':'danger', u.status==='active'?'在職':'停用')}</td>
           <td>
             <button class="btn btn-ghost btn-sm" onclick="editEmployee(${u.id})">編輯</button>
             ${u.role !== 'admin' ? `<button class="btn btn-sm ${u.status==='active'?'btn-danger':'btn-success'}" onclick="toggleEmployee(${u.id})">${u.status==='active'?'停用':'啟用'}</button>` : ''}
           </td>
         </tr>`).join('')}</tbody>
       </table></div>
-    </div>
-  `;
+    </div>`;
 }
 
 function showEmployeeForm(user) {
   const isEdit = !!user;
   const depts = db.departments;
+  const sel = (val, match) => isEdit && val === match ? 'selected' : '';
   showModal(isEdit ? '編輯員工' : '新增員工', `
     <div class="form-row">
       <div class="form-group"><label>員工編號</label><input type="text" class="form-control" id="empId" value="${isEdit?user.employeeId:('A'+String(db.nextId.users).padStart(3,'0'))}" ${isEdit?'readonly':''}></div>
@@ -1330,18 +1084,18 @@ function showEmployeeForm(user) {
       <div class="form-group"><label>密碼</label><input type="text" class="form-control" id="empPass" value="${isEdit?user.password:'123456'}" placeholder="預設 123456"></div>
     </div>
     <div class="form-row">
-      <div class="form-group"><label>部門</label><select class="form-control" id="empDept">${depts.map(d=>`<option value="${d.id}" ${isEdit&&user.departmentId===d.id?'selected':''}>${d.name}</option>`).join('')}</select></div>
+      <div class="form-group"><label>部門</label><select class="form-control" id="empDept">${depts.map(d=>`<option value="${d.id}" ${sel(user&&user.departmentId,d.id)}>${d.name}</option>`).join('')}</select></div>
       <div class="form-group"><label>角色</label><select class="form-control" id="empRole">
-        <option value="employee" ${isEdit&&user.role==='employee'?'selected':''}>一般員工</option>
-        <option value="manager" ${isEdit&&user.role==='manager'?'selected':''}>部門主管</option>
-        <option value="admin" ${isEdit&&user.role==='admin'?'selected':''}>系統管理員</option>
+        <option value="employee" ${sel(user&&user.role,'employee')}>一般員工</option>
+        <option value="manager" ${sel(user&&user.role,'manager')}>部門主管</option>
+        <option value="admin" ${sel(user&&user.role,'admin')}>系統管理員</option>
       </select></div>
     </div>
     <div class="form-row">
       <div class="form-group"><label>月薪</label><input type="number" class="form-control" id="empSalary" value="${isEdit?user.salary:40000}"></div>
       <div class="form-group"><label>到職日</label><input type="date" class="form-control" id="empHire" value="${isEdit?user.hireDate:today()}"></div>
     </div>
-  `, `<button class="btn btn-ghost" onclick="closeModal()">取消</button><button class="btn btn-primary" onclick="submitEmployee(${isEdit?user.id:'null'})">${isEdit?'更新':'新增'}</button>`);
+  `, modalFooter(isEdit?'更新':'新增', `submitEmployee(${isEdit?user.id:'null'})`));
 }
 
 function submitEmployee(editId) {
@@ -1358,23 +1112,17 @@ function submitEmployee(editId) {
   if (!data.name || !data.email) { toast('請填寫完整資訊','error'); return; }
 
   if (editId) {
-    const u = db.users.find(u => u.id === editId);
-    Object.assign(u, data);
+    Object.assign(db.users.find(u => u.id === editId), data);
   } else {
     data.id = db.nextId.users++;
     data.status = 'active';
     db.users.push(data);
-    // Create leave balances
-    const types = ['特休','病假','事假','婚假','喪假'];
-    const days = [7,30,14,8,8];
+    const types = ['特休','病假','事假','婚假','喪假'], days = [7,30,14,8,8];
     types.forEach((t,i) => {
       db.leaveBalances.push({ id: db.leaveBalances.length+1, userId: data.id, leaveType:t, totalDays:days[i], usedDays:0, year: new Date().getFullYear() });
     });
   }
-  saveDB(db);
-  closeModal();
-  toast(editId ? '員工資料已更新' : '員工已新增');
-  renderEmployees();
+  saveDB(db); closeModal(); toast(editId ? '員工資料已更新' : '員工已新增'); renderEmployees();
 }
 
 function editEmployee(id) { showEmployeeForm(db.users.find(u => u.id === id)); }
@@ -1382,9 +1130,7 @@ function editEmployee(id) { showEmployeeForm(db.users.find(u => u.id === id)); }
 function toggleEmployee(id) {
   const u = db.users.find(u => u.id === id);
   u.status = u.status === 'active' ? 'inactive' : 'active';
-  saveDB(db);
-  toast(`已${u.status === 'active' ? '啟用' : '停用'} ${u.name}`);
-  renderEmployees();
+  saveDB(db); toast(`已${u.status === 'active' ? '啟用' : '停用'} ${u.name}`); renderEmployees();
 }
 
 // ============================================================
@@ -1396,18 +1142,14 @@ function renderDepartments() {
       <div class="card-header"><h3>部門管理</h3><button class="btn btn-primary btn-sm" onclick="showDeptForm()">＋ 新增部門</button></div>
       <div class="table-wrap"><table>
         <thead><tr><th>部門名稱</th><th>主管</th><th>人數</th><th>操作</th></tr></thead>
-        <tbody>${db.departments.map(d => {
-          const count = db.users.filter(u=>u.departmentId===d.id&&u.status==='active').length;
-          return `<tr>
-            <td style="font-weight:600">${d.name}</td>
-            <td>${getUserName(d.managerId)}</td>
-            <td>${count} 人</td>
-            <td><button class="btn btn-ghost btn-sm" onclick="editDept(${d.id})">編輯</button></td>
-          </tr>`;
-        }).join('')}</tbody>
+        <tbody>${db.departments.map(d => `<tr>
+          <td style="font-weight:600">${d.name}</td>
+          <td>${getUserName(d.managerId)}</td>
+          <td>${db.users.filter(u=>u.departmentId===d.id&&u.status==='active').length} 人</td>
+          <td><button class="btn btn-ghost btn-sm" onclick="editDept(${d.id})">編輯</button></td>
+        </tr>`).join('')}</tbody>
       </table></div>
-    </div>
-  `;
+    </div>`;
 }
 
 function showDeptForm(dept) {
@@ -1419,7 +1161,7 @@ function showDeptForm(dept) {
       <option value="">-- 選擇主管 --</option>
       ${managers.map(m=>`<option value="${m.id}" ${isEdit&&dept.managerId===m.id?'selected':''}>${m.name} (${m.employeeId})</option>`).join('')}
     </select></div>
-  `, `<button class="btn btn-ghost" onclick="closeModal()">取消</button><button class="btn btn-primary" onclick="submitDept(${isEdit?dept.id:'null'})">${isEdit?'更新':'新增'}</button>`);
+  `, modalFooter(isEdit?'更新':'新增', `submitDept(${isEdit?dept.id:'null'})`));
 }
 
 function submitDept(editId) {
@@ -1442,10 +1184,7 @@ function editDept(id) { showDeptForm(db.departments.find(d => d.id === id)); }
 // ============================================================
 function renderSalary() {
   const now = new Date();
-  const year = now.getFullYear();
-  const month = now.getMonth();
-  const monthStr = `${year}-${String(month+1).padStart(2,'0')}`;
-
+  const monthStr = `${now.getFullYear()}-${pad2(now.getMonth()+1)}`;
   document.getElementById('pageContent').innerHTML = `
     <div class="card">
       <div class="card-header"><h3>薪資報表</h3>
@@ -1455,8 +1194,7 @@ function renderSalary() {
         </div>
       </div>
       <div id="salaryTable"></div>
-    </div>
-  `;
+    </div>`;
   calcSalary();
 }
 
@@ -1465,33 +1203,24 @@ function calcSalary() {
   const [year, month] = monthStr.split('-').map(Number);
   const daysInMonth = new Date(year, month, 0).getDate();
 
-  // Count work days
   let workDays = 0;
-  for (let d = 1; d <= daysInMonth; d++) {
-    const date = new Date(year, month - 1, d);
-    if (date.getDay() !== 0 && date.getDay() !== 6) workDays++;
-  }
+  for (let d = 1; d <= daysInMonth; d++) { const date = new Date(year, month - 1, d); if (date.getDay() !== 0 && date.getDay() !== 6) workDays++; }
 
   const rows = db.users.filter(u => u.status === 'active').map(u => {
     const monthRecords = db.attendance.filter(a => a.userId === u.id && a.date.startsWith(monthStr));
-    const attendDays = monthRecords.length;
     const lateMins = monthRecords.reduce((s,r) => s + (r.lateMinutes || 0), 0);
     const earlyMins = monthRecords.reduce((s,r) => s + (r.earlyLeaveMinutes || 0), 0);
-    const absentDays = workDays - attendDays;
+    const absentDays = workDays - monthRecords.length;
+    const otHours = db.overtime.filter(o => o.userId === u.id && o.date.startsWith(monthStr) && o.status === 'approved').reduce((s,o) => s + o.hours, 0);
 
-    // Approved OT hours this month
-    const otHours = db.overtime.filter(o => o.userId === u.id && o.date.startsWith(monthStr) && o.status === 'approved')
-      .reduce((s,o) => s + o.hours, 0);
-
-    const dailyRate = u.salary / workDays;
-    const hourlyRate = dailyRate / 8;
-    const latePenalty = Math.floor(lateMins / 30) * (hourlyRate * 0.5);
-    const earlyPenalty = Math.floor(earlyMins / 30) * (hourlyRate * 0.5);
-    const absentDeduct = absentDays * dailyRate;
-    const otPay = otHours * hourlyRate * (db.settings.overtimeRate || 1.33);
+    const dailyRate = u.salary / workDays, hourlyRate = dailyRate / 8;
+    const latePenalty = Math.round(Math.floor(lateMins / 30) * (hourlyRate * 0.5));
+    const earlyPenalty = Math.round(Math.floor(earlyMins / 30) * (hourlyRate * 0.5));
+    const absentDeduct = Math.round(absentDays * dailyRate);
+    const otPay = Math.round(otHours * hourlyRate * (db.settings.overtimeRate || 1.33));
     const totalPay = Math.round(u.salary - latePenalty - earlyPenalty - absentDeduct + otPay) || 0;
 
-    return { ...u, attendDays, lateMins, earlyMins, absentDays, otHours, latePenalty: Math.round(latePenalty), earlyPenalty: Math.round(earlyPenalty), absentDeduct: Math.round(absentDeduct), otPay: Math.round(otPay), totalPay };
+    return { ...u, attendDays: monthRecords.length, lateMins, earlyMins, absentDays, otHours, latePenalty, earlyPenalty, absentDeduct, otPay, totalPay };
   });
 
   document.getElementById('salaryTable').innerHTML = `
@@ -1510,8 +1239,7 @@ function calcSalary() {
       </tr>`).join('')}</tbody>
       <tfoot><tr><td colspan="8" style="font-weight:700;text-align:right">合計</td><td style="font-weight:700;color:var(--accent)">$${rows.reduce((s,r)=>s+r.totalPay,0).toLocaleString()}</td></tr></tfoot>
     </table></div>
-    <p style="margin-top:12px;font-size:11px;color:var(--text-muted)">* 遲到/早退每滿30分鐘扣時薪50%，曠職扣全日薪，加班費率 ${db.settings.overtimeRate}x</p>
-  `;
+    <p style="margin-top:12px;font-size:11px;color:var(--text-muted)">* 遲到/早退每滿30分鐘扣時薪50%，曠職扣全日薪，加班費率 ${db.settings.overtimeRate}x</p>`;
 }
 
 // ============================================================
@@ -1519,8 +1247,7 @@ function calcSalary() {
 // ============================================================
 function renderReports() {
   const now = new Date();
-  const monthStr = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}`;
-
+  const monthStr = `${now.getFullYear()}-${pad2(now.getMonth()+1)}`;
   document.getElementById('pageContent').innerHTML = `
     <div class="card">
       <div class="card-header"><h3>統計報表</h3>
@@ -1531,9 +1258,16 @@ function renderReports() {
       <div class="card" id="deptReport"></div>
       <div class="card" id="statusReport"></div>
     </div>
-    <div class="card" id="rankReport" style="margin-top:16px"></div>
-  `;
+    <div class="card" id="rankReport" style="margin-top:16px"></div>`;
   updateReports();
+}
+
+function progressBar(label, count, total, color) {
+  const pct = Math.round(count / total * 100);
+  return `<div style="margin-bottom:16px">
+    <div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:4px"><span>${label}</span><span>${count} 次 (${pct}%)</span></div>
+    <div style="height:8px;background:var(--bg-secondary);border-radius:4px;overflow:hidden"><div style="height:100%;width:${count/total*100}%;background:var(--${color});border-radius:4px"></div></div>
+  </div>`;
 }
 
 function updateReports() {
@@ -1543,8 +1277,7 @@ function updateReports() {
   const deptStats = db.departments.map(d => {
     const users = db.users.filter(u => u.departmentId === d.id && u.status === 'active');
     const records = db.attendance.filter(a => a.date.startsWith(monthStr) && users.some(u => u.id === a.userId));
-    const lateCount = records.filter(r => r.status.includes('late')).length;
-    return { name: d.name, total: users.length, records: records.length, late: lateCount };
+    return { name: d.name, total: users.length, records: records.length, late: records.filter(r => r.status.includes('late')).length };
   });
 
   document.getElementById('deptReport').innerHTML = `
@@ -1553,35 +1286,20 @@ function updateReports() {
       <thead><tr><th>部門</th><th>人數</th><th>打卡次數</th><th>遲到次數</th><th>出勤率</th></tr></thead>
       <tbody>${deptStats.map(d => {
         const rate = d.total > 0 ? Math.round((d.records / (d.total * 22)) * 100) : 0;
-        return `<tr><td style="font-weight:600">${d.name}</td><td>${d.total}</td><td>${d.records}</td><td style="color:var(--danger)">${d.late}</td><td><span class="badge ${rate>=90?'badge-success':rate>=70?'badge-warning':'badge-danger'}">${rate}%</span></td></tr>`;
+        return `<tr><td style="font-weight:600">${d.name}</td><td>${d.total}</td><td>${d.records}</td><td style="color:var(--danger)">${d.late}</td><td>${statusBadgeHtml(rate>=90?'success':rate>=70?'warning':'danger', rate+'%')}</td></tr>`;
       }).join('')}</tbody>
-    </table>
-  `;
+    </table>`;
 
   // Status distribution
   const allRecords = db.attendance.filter(a => a.date.startsWith(monthStr));
-  const normalCount = allRecords.filter(r => r.status === 'normal').length;
-  const lateTotal = allRecords.filter(r => r.status.includes('late')).length;
-  const earlyTotal = allRecords.filter(r => r.status.includes('early')).length;
   const total = allRecords.length || 1;
-
   document.getElementById('statusReport').innerHTML = `
     <div class="card-header"><h3>出勤狀態分佈</h3></div>
     <div style="padding:20px">
-      <div style="margin-bottom:16px">
-        <div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:4px"><span>正常</span><span>${normalCount} 次 (${Math.round(normalCount/total*100)}%)</span></div>
-        <div style="height:8px;background:var(--bg-secondary);border-radius:4px;overflow:hidden"><div style="height:100%;width:${normalCount/total*100}%;background:var(--success);border-radius:4px"></div></div>
-      </div>
-      <div style="margin-bottom:16px">
-        <div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:4px"><span>遲到</span><span>${lateTotal} 次 (${Math.round(lateTotal/total*100)}%)</span></div>
-        <div style="height:8px;background:var(--bg-secondary);border-radius:4px;overflow:hidden"><div style="height:100%;width:${lateTotal/total*100}%;background:var(--danger);border-radius:4px"></div></div>
-      </div>
-      <div style="margin-bottom:16px">
-        <div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:4px"><span>早退</span><span>${earlyTotal} 次 (${Math.round(earlyTotal/total*100)}%)</span></div>
-        <div style="height:8px;background:var(--bg-secondary);border-radius:4px;overflow:hidden"><div style="height:100%;width:${earlyTotal/total*100}%;background:var(--warning);border-radius:4px"></div></div>
-      </div>
-    </div>
-  `;
+      ${progressBar('正常', allRecords.filter(r => r.status === 'normal').length, total, 'success')}
+      ${progressBar('遲到', allRecords.filter(r => r.status.includes('late')).length, total, 'danger')}
+      ${progressBar('早退', allRecords.filter(r => r.status.includes('early')).length, total, 'warning')}
+    </div>`;
 
   // Employee ranking
   const userStats = db.users.filter(u => u.status === 'active').map(u => {
@@ -1602,8 +1320,7 @@ function updateReports() {
         <td style="color:var(--success)">${u.onTime}</td>
         <td style="color:var(--danger)">${u.late}</td>
       </tr>`).join('')}</tbody>
-    </table>
-  `;
+    </table>`;
 }
 
 // ============================================================
