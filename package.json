@@ -1,0 +1,15 @@
+{
+  "name": "duck-hr-system",
+  "version": "1.0.0",
+  "description": "DUCK 企業打卡系統",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "sql.js": "^1.10.0",
+    "bcryptjs": "^2.4.3",
+    "jsonwebtoken": "^9.0.2"
+  }
+}
