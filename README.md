@@ -34,7 +34,7 @@ npm install
 node server.js
 ```
 
-開啟瀏覽器到 `http://localhost:3000`
+開啟瀏覽器到 `http://localhost:3007`
 
 預設帳號：`admin` / `admin123`
 
