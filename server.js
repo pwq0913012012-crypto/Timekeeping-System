@@ -1,17 +1,34 @@
 // ============================================================
-// DUCK 企業打卡系統 — Express + sql.js Backend
+// DUCK 企業打卡系統 — Express + libsql (Turso) Backend
 // ============================================================
 const express = require('express');
 const path = require('path');
 const fs = require('fs');
-const initSqlJs = require('sql.js');
+const { createClient } = require('@libsql/client');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const { reseedDemoData } = require('./lib/demo-data');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3007;
 const JWT_SECRET = process.env.JWT_SECRET || 'duck-hr-system-secret-key-2024';
-const DB_PATH = path.join(__dirname, 'hr_system.db');
+
+// 資料庫連線：
+//   - 正式 (Vercel): 使用 Turso 雲端，需設定 TURSO_DATABASE_URL + TURSO_AUTH_TOKEN
+//   - 本機: 預設用 file:./hr_system_v2.db (本地 SQLite)
+const dbUrl = process.env.TURSO_DATABASE_URL || 'file:' + path.join(__dirname, 'hr_system_v2.db');
+const dbAuthToken = process.env.TURSO_AUTH_TOKEN;
+
+let db; // libsql client
+function getDb() {
+  if (!db) {
+    db = createClient({
+      url: dbUrl,
+      authToken: dbAuthToken,
+    });
+  }
+  return db;
+}
 
 // ============================================================
 // MIDDLEWARE
@@ -43,41 +60,39 @@ function fmtDate(d) {
 
 function todayStr() { return fmtDate(new Date()); }
 
-// sql.js helpers
-let db;
-
-function dbAll(sql, params = []) {
-  const stmt = db.prepare(sql);
-  if (params.length) stmt.bind(params);
-  const results = [];
-  while (stmt.step()) {
-    results.push(stmt.getAsObject());
-  }
-  stmt.free();
-  return results;
+// ============================================================
+// libsql (Turso) DB HELPERS
+// ============================================================
+async function dbAll(sql, params = []) {
+  const result = await getDb().execute({ sql, args: params });
+  return result.rows.map(r => {
+    // libsql 回傳的 row 已經是物件 (具 columnName 屬性)，但我們程式碼到處
+    // 用 `row.某欄位`，所以保持 plain object
+    const obj = {};
+    for (const k of Object.keys(r)) obj[k] = r[k];
+    return obj;
+  });
 }
 
-function dbGet(sql, params = []) {
-  const rows = dbAll(sql, params);
+async function dbGet(sql, params = []) {
+  const rows = await dbAll(sql, params);
   return rows.length > 0 ? rows[0] : null;
 }
 
-function dbRun(sql, params = []) {
-  db.run(sql, params);
-  return { lastInsertRowid: dbGet('SELECT last_insert_rowid() as id').id, changes: db.getRowsModified() };
+async function dbRun(sql, params = []) {
+  const result = await getDb().execute({ sql, args: params });
+  return {
+    lastInsertRowid: Number(result.lastInsertRowid ?? 0),
+    changes: result.rowsAffected ?? 0,
+  };
 }
 
-function saveDatabase() {
-  const data = db.export();
-  const buffer = Buffer.from(data);
-  fs.writeFileSync(DB_PATH, buffer);
-}
+// 相容呼叫：舊程式碼有 saveDatabase() — libsql 每個 execute 都即時寫入，
+// 所以這裡是 no-op，留著避免動太多呼叫點。
+function saveDatabase() { /* no-op on libsql */ }
 
-// Periodic save
-setInterval(saveDatabase, 30000);
-
-function getUserShift(userId, dateStr) {
-  const s = dbGet('SELECT shift_type FROM schedules WHERE user_id = ? AND date = ?', [userId, dateStr]);
+async function getUserShift(userId, dateStr) {
+  const s = await dbGet('SELECT shift_type FROM schedules WHERE user_id = ? AND date = ?', [userId, dateStr]);
   if (s) return s.shift_type;
   return UID_SHIFT_MAP[userId] || 'morning';
 }
@@ -178,8 +193,8 @@ function departmentToJSON(d) {
 // ============================================================
 // CREATE TABLES
 // ============================================================
-function createTables() {
-  db.run(`
+async function createTables() {
+  await dbRun(`
     CREATE TABLE IF NOT EXISTS users (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       employee_id TEXT UNIQUE NOT NULL,
@@ -193,14 +208,14 @@ function createTables() {
       hire_date TEXT
     )
   `);
-  db.run(`
+  await dbRun(`
     CREATE TABLE IF NOT EXISTS departments (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       name TEXT NOT NULL,
       manager_id INTEGER
     )
   `);
-  db.run(`
+  await dbRun(`
     CREATE TABLE IF NOT EXISTS attendance (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       user_id INTEGER NOT NULL,
@@ -213,7 +228,7 @@ function createTables() {
       shift TEXT DEFAULT 'morning'
     )
   `);
-  db.run(`
+  await dbRun(`
     CREATE TABLE IF NOT EXISTS leaves (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       user_id INTEGER NOT NULL,
@@ -226,7 +241,7 @@ function createTables() {
       created_at TEXT
     )
   `);
-  db.run(`
+  await dbRun(`
     CREATE TABLE IF NOT EXISTS overtime (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       user_id INTEGER NOT NULL,
@@ -237,7 +252,7 @@ function createTables() {
       approved_by INTEGER
     )
   `);
-  db.run(`
+  await dbRun(`
     CREATE TABLE IF NOT EXISTS announcements (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       title TEXT NOT NULL,
@@ -247,7 +262,7 @@ function createTables() {
       pinned INTEGER DEFAULT 0
     )
   `);
-  db.run(`
+  await dbRun(`
     CREATE TABLE IF NOT EXISTS schedules (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       user_id INTEGER NOT NULL,
@@ -255,7 +270,7 @@ function createTables() {
       shift_type TEXT NOT NULL
     )
   `);
-  db.run(`
+  await dbRun(`
     CREATE TABLE IF NOT EXISTS leave_balances (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       user_id INTEGER NOT NULL,
@@ -265,7 +280,7 @@ function createTables() {
       year INTEGER NOT NULL
     )
   `);
-  db.run(`
+  await dbRun(`
     CREATE TABLE IF NOT EXISTS meta (
       key TEXT PRIMARY KEY,
       value TEXT
@@ -276,18 +291,18 @@ function createTables() {
 // ============================================================
 // SEED DATA
 // ============================================================
-function seedDatabase() {
-  const userCount = dbGet('SELECT COUNT(*) as count FROM users');
+async function seedDatabase() {
+  const userCount = await dbGet('SELECT COUNT(*) as count FROM users');
   if (userCount && userCount.count > 0) return;
 
   const now = new Date();
   const year = now.getFullYear();
 
   // Departments
-  dbRun('INSERT INTO departments (id, name, manager_id) VALUES (?, ?, ?)', [1, '研發部', 2]);
-  dbRun('INSERT INTO departments (id, name, manager_id) VALUES (?, ?, ?)', [2, '業務部', 4]);
-  dbRun('INSERT INTO departments (id, name, manager_id) VALUES (?, ?, ?)', [3, '人資部', 1]);
-  dbRun('INSERT INTO departments (id, name, manager_id) VALUES (?, ?, ?)', [4, '財務部', 7]);
+  await dbRun('INSERT INTO departments (id, name, manager_id) VALUES (?, ?, ?)', [1, '研發部', 2]);
+  await dbRun('INSERT INTO departments (id, name, manager_id) VALUES (?, ?, ?)', [2, '業務部', 4]);
+  await dbRun('INSERT INTO departments (id, name, manager_id) VALUES (?, ?, ?)', [3, '人資部', 1]);
+  await dbRun('INSERT INTO departments (id, name, manager_id) VALUES (?, ?, ?)', [4, '財務部', 7]);
 
   // Users
   const users = [
@@ -306,134 +321,108 @@ function seedDatabase() {
   ];
   for (const u of users) {
     const hashed = bcrypt.hashSync(u[4], 10);
-    dbRun('INSERT INTO users (id, employee_id, name, email, password, department_id, role, salary, status, hire_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    await dbRun('INSERT INTO users (id, employee_id, name, email, password, department_id, role, salary, status, hire_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
       [u[0], u[1], u[2], u[3], hashed, u[5], u[6], u[7], u[8], u[9]]);
   }
 
   // Sample attendance
-  generateSampleAttendance(now);
+  await generateSampleAttendance(now);
 
   // Leaves
-  dbRun('INSERT INTO leaves (user_id, type, start_date, end_date, reason, status, approved_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+  await dbRun('INSERT INTO leaves (user_id, type, start_date, end_date, reason, status, approved_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
     [3, '特休', `${year}-03-25`, `${year}-03-26`, '家庭旅遊', 'approved', 2, `${year}-03-20`]);
-  dbRun('INSERT INTO leaves (user_id, type, start_date, end_date, reason, status, approved_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+  await dbRun('INSERT INTO leaves (user_id, type, start_date, end_date, reason, status, approved_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
     [5, '病假', `${year}-03-28`, `${year}-03-28`, '感冒發燒', 'approved', 4, `${year}-03-27`]);
-  dbRun('INSERT INTO leaves (user_id, type, start_date, end_date, reason, status, approved_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+  await dbRun('INSERT INTO leaves (user_id, type, start_date, end_date, reason, status, approved_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
     [8, '事假', `${year}-04-05`, `${year}-04-05`, '個人事務', 'pending', null, `${year}-04-01`]);
 
   // Overtime
-  dbRun('INSERT INTO overtime (user_id, date, hours, reason, status, approved_by) VALUES (?, ?, ?, ?, ?, ?)',
+  await dbRun('INSERT INTO overtime (user_id, date, hours, reason, status, approved_by) VALUES (?, ?, ?, ?, ?, ?)',
     [3, `${year}-03-20`, 2, '專案趕工', 'approved', 2]);
-  dbRun('INSERT INTO overtime (user_id, date, hours, reason, status, approved_by) VALUES (?, ?, ?, ?, ?, ?)',
+  await dbRun('INSERT INTO overtime (user_id, date, hours, reason, status, approved_by) VALUES (?, ?, ?, ?, ?, ?)',
     [5, `${year}-03-22`, 3, '客戶需求緊急', 'approved', 4]);
-  dbRun('INSERT INTO overtime (user_id, date, hours, reason, status, approved_by) VALUES (?, ?, ?, ?, ?, ?)',
+  await dbRun('INSERT INTO overtime (user_id, date, hours, reason, status, approved_by) VALUES (?, ?, ?, ?, ?, ?)',
     [6, `${year}-04-01`, 1.5, '月報整理', 'pending', null]);
 
   // Announcements
-  dbRun('INSERT INTO announcements (title, content, author_id, created_at, pinned) VALUES (?, ?, ?, ?, ?)',
+  await dbRun('INSERT INTO announcements (title, content, author_id, created_at, pinned) VALUES (?, ?, ?, ?, ?)',
     ['四月份員工旅遊通知', '本月 25 日（星期六）將舉辦公司員工旅遊，地點為日月潭。請各部門於 4/10 前回報參加人數。交通統一安排遊覽車，費用由公司全額補助。', 1, `${year}-04-01T09:00:00`, 1]);
-  dbRun('INSERT INTO announcements (title, content, author_id, created_at, pinned) VALUES (?, ?, ?, ?, ?)',
+  await dbRun('INSERT INTO announcements (title, content, author_id, created_at, pinned) VALUES (?, ?, ?, ?, ?)',
     ['系統維護公告', '本週六晚間 22:00 至隔日 06:00 將進行系統維護，期間打卡系統暫停服務。請同仁提前完成打卡作業。', 1, `${year}-03-28T14:30:00`, 0]);
-  dbRun('INSERT INTO announcements (title, content, author_id, created_at, pinned) VALUES (?, ?, ?, ?, ?)',
+  await dbRun('INSERT INTO announcements (title, content, author_id, created_at, pinned) VALUES (?, ?, ?, ?, ?)',
     ['新進員工歡迎會', '歡迎三月份加入的新同仁！本週五下午 3 點將於 B1 會議室舉辦歡迎茶會，邀請各位同仁踴躍參加。', 6, `${year}-03-26T10:00:00`, 0]);
 
   // Schedules
-  generateDefaultSchedules(now);
+  await generateDefaultSchedules(now);
 
   // Leave balances
-  generateLeaveBalances(year);
+  await generateLeaveBalances(year);
 
   saveDatabase();
   console.log('Database seeded successfully.');
 }
 
-function generateSampleAttendance(now) {
+async function generateSampleAttendance(now) {
+  // 展示資料：除了系統管理員 (uid=1)，其他所有員工每個工作日都正常打卡
+  // 每個班別的打卡時間都固定（準時上下班，無遲到無早退無缺勤），
+  // 用意是給展示用，狀態看起來整齊漂亮。
   const year = now.getFullYear(), month = now.getMonth();
-  const SHIFT_CFG = {
-    morning:   { startH:9, startM:0, endH:18, endM:0, earlyBase:8, earlyRange:15 },
-    afternoon: { startH:14, startM:0, endH:22, endM:0, earlyBase:13, earlyRange:15 },
-    night:     { startH:22, startM:0, endH:6, endM:0, earlyBase:21, earlyRange:15 }
-  };
+  const nowMin = now.getHours() * 60 + now.getMinutes();
+  const today = fmtDate(now);
 
-  let seed = year * 10000 + month * 100 + now.getDate();
-  function srand() { seed = (seed * 16807 + 7) % 2147483647; return (seed & 0x7fffffff) / 2147483647; }
+  // 每個 shift 的打卡時間（固定值，不隨機，讓畫面整齊）
+  const SHIFT_PUNCH = {
+    morning:   { clockIn: '08:55', clockOut: '18:05', endH: 18 },
+    afternoon: { clockIn: '13:55', clockOut: '22:05', endH: 22 },
+    night:     { clockIn: '21:55', clockOut: '06:05', endH: 6 }, // 跨夜
+  };
 
   const records = [];
 
+  // 過去 30 天 + 今天，每一天都寫入 (含週末, 讓展示畫面隨時都有資料)
   for (let d = 29; d >= 0; d--) {
     const date = new Date(year, month, now.getDate() - d);
-    if (date.getDay() === 0 || date.getDay() === 6) continue;
     const dateStr = fmtDate(date);
-    const nowMin = now.getHours() * 60 + now.getMinutes();
+    const isToday = dateStr === today;
 
     for (let uid = 2; uid <= 12; uid++) {
-      let clockIn, clockOut, status = 'normal', lateMins = 0, earlyMins = 0;
-      const r1 = srand(), r2 = srand();
       const shift = UID_SHIFT_MAP[uid] || 'morning';
-      const cfg = SHIFT_CFG[shift];
-      const shiftStartMin = cfg.startH * 60 + cfg.startM;
-      const shiftEndMin = cfg.endH * 60 + (cfg.endM || 0);
-      const crossesMidnight = shiftEndMin < shiftStartMin;
+      const cfg = SHIFT_PUNCH[shift];
+      let { clockIn, clockOut } = cfg;
 
-      if (r1 < 0.05 && d > 0) continue;
-      if (d === 0 && nowMin < shiftStartMin - 15) continue;
-
-      if (r1 < 0.20) {
-        lateMins = Math.floor(srand() * 25) + 5;
-        clockIn = minToTime(shiftStartMin + lateMins);
-        status = 'late';
-      } else {
-        clockIn = minToTime(cfg.earlyBase * 60 + Math.floor(srand() * cfg.earlyRange) + 45);
-      }
-
-      if (d === 0) {
+      // 今天的資料：根據現在時間判斷是否已下班
+      if (isToday) {
         const [ciH, ciM] = clockIn.split(':').map(Number);
-        if (ciH * 60 + ciM > nowMin) continue;
-        const shiftEnded = crossesMidnight
-          ? (nowMin > shiftEndMin && nowMin < shiftStartMin)
-          : (nowMin > shiftEndMin);
-        if (shiftEnded) {
-          clockOut = srand() < 0.8 ? `${pad2(cfg.endH)}:${pad2(Math.floor(srand() * 15))}` : null;
+        const clockInMin = ciH * 60 + ciM;
+        // 還沒到上班時間 → 不產生記錄（讓 UI 顯示「待上班」）
+        if (nowMin < clockInMin) continue;
+
+        // 判斷是否該有 clockOut
+        const crossesMidnight = shift === 'night';
+        if (crossesMidnight) {
+          // 夜班 21:55 - 06:05；如果現在還在班內 (21:55 之後 或 06:05 之前) → 未下班
+          const inShift = (nowMin >= clockInMin) || (nowMin < cfg.endH * 60 + 5);
+          if (inShift && nowMin >= clockInMin) clockOut = null;
         } else {
-          clockOut = null;
-        }
-      } else {
-        const isCrossMidnight = cfg.endH < cfg.startH;
-        if (d === 1 && isCrossMidnight && nowMin < cfg.endH * 60 + (cfg.endM || 0)) {
-          clockOut = null;
-        } else if (r2 < 0.15) {
-          earlyMins = Math.floor(srand() * 25) + 5;
-          clockOut = minToTime(cfg.endH * 60 - earlyMins);
-          status = status === 'late' ? 'late+early' : 'early';
-        } else {
-          clockOut = `${pad2(cfg.endH)}:${pad2(Math.floor(srand() * 25))}`;
+          // 日/中班：現在時間 < 下班時間 → 還沒下班
+          if (nowMin < cfg.endH * 60 + 5) clockOut = null;
         }
       }
-      records.push({ uid, dateStr, clockIn, clockOut, status, lateMins, earlyMins, shift });
+
+      records.push({
+        uid, dateStr, clockIn, clockOut,
+        status: 'normal', lateMins: 0, earlyMins: 0, shift
+      });
     }
   }
 
-  // Guaranteed early leave records (yesterday)
-  const yesterday = new Date(year, month, now.getDate() - 1);
-  if (yesterday.getDay() !== 0 && yesterday.getDay() !== 6) {
-    const yd = fmtDate(yesterday);
-    const filtered = records.filter(r => !(r.dateStr === yd && [5, 7, 10, 12].includes(r.uid)));
-    records.length = 0;
-    records.push(...filtered);
-
-    records.push({ uid:5, dateStr:yd, clockIn:'08:52', clockOut:'17:35', status:'early', lateMins:0, earlyMins:25, shift:'morning' });
-    records.push({ uid:7, dateStr:yd, clockIn:'08:48', clockOut:'17:42', status:'early', lateMins:0, earlyMins:18, shift:'morning' });
-    records.push({ uid:10, dateStr:yd, clockIn:'13:55', clockOut:'21:38', status:'early', lateMins:0, earlyMins:22, shift:'afternoon' });
-    records.push({ uid:12, dateStr:yd, clockIn:'21:50', clockOut:'05:40', status:'early', lateMins:0, earlyMins:20, shift:'night' });
-  }
-
   for (const r of records) {
-    dbRun('INSERT INTO attendance (user_id, date, clock_in, clock_out, status, late_minutes, early_leave_minutes, shift) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+    await dbRun('INSERT INTO attendance (user_id, date, clock_in, clock_out, status, late_minutes, early_leave_minutes, shift) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
       [r.uid, r.dateStr, r.clockIn, r.clockOut || null, r.status, r.lateMins, r.earlyMins, r.shift]);
   }
 }
 
-function generateDefaultSchedules(now) {
+async function generateDefaultSchedules(now) {
   const weekStart = new Date(now);
   weekStart.setDate(now.getDate() - (now.getDay() === 0 ? 6 : now.getDay() - 1));
   for (let w = 0; w < 14; w++) {
@@ -441,110 +430,82 @@ function generateDefaultSchedules(now) {
     d.setDate(weekStart.getDate() + w);
     if (d.getDay() === 0 || d.getDay() === 6) continue;
     const dateStr = fmtDate(d);
-    dbRun('INSERT INTO schedules (user_id, date, shift_type) VALUES (?, ?, ?)', [9, dateStr, 'afternoon']);
-    dbRun('INSERT INTO schedules (user_id, date, shift_type) VALUES (?, ?, ?)', [10, dateStr, 'afternoon']);
-    dbRun('INSERT INTO schedules (user_id, date, shift_type) VALUES (?, ?, ?)', [11, dateStr, 'night']);
-    dbRun('INSERT INTO schedules (user_id, date, shift_type) VALUES (?, ?, ?)', [12, dateStr, 'night']);
+    await dbRun('INSERT INTO schedules (user_id, date, shift_type) VALUES (?, ?, ?)', [9, dateStr, 'afternoon']);
+    await dbRun('INSERT INTO schedules (user_id, date, shift_type) VALUES (?, ?, ?)', [10, dateStr, 'afternoon']);
+    await dbRun('INSERT INTO schedules (user_id, date, shift_type) VALUES (?, ?, ?)', [11, dateStr, 'night']);
+    await dbRun('INSERT INTO schedules (user_id, date, shift_type) VALUES (?, ?, ?)', [12, dateStr, 'night']);
   }
 }
 
-function generateLeaveBalances(year) {
+async function generateLeaveBalances(year) {
   const types = ['特休','病假','事假','婚假','喪假'];
   const days = [7, 30, 14, 8, 8];
   let seed = year * 31;
   function srand() { seed = (seed * 16807 + 7) % 2147483647; return (seed & 0x7fffffff) / 2147483647; }
 
   for (let uid = 1; uid <= 12; uid++) {
-    types.forEach((t, i) => {
+    for (let i = 0; i < types.length; i++) {
       const used = Math.floor(srand() * Math.min(3, days[i]));
-      dbRun('INSERT INTO leave_balances (user_id, leave_type, total_days, used_days, year) VALUES (?, ?, ?, ?, ?)',
-        [uid, t, days[i], used, year]);
-    });
+      await dbRun('INSERT INTO leave_balances (user_id, leave_type, total_days, used_days, year) VALUES (?, ?, ?, ?, ?)',
+        [uid, types[i], days[i], used, year]);
+    }
   }
 }
 
 // ============================================================
 // WEEKLY CYCLE ATTENDANCE (ensureTodayAttendance)
 // ============================================================
-function ensureTodayAttendance(excludeUserId) {
+// 記憶體快取：同一個實例 2 分鐘內不重複補資料，降低每次登入的延遲
+let __ensureCache = { date: null, at: 0 };
+
+async function ensureTodayAttendance(excludeUserId) {
   const today = todayStr();
   const now = new Date();
   const nowMin = now.getHours() * 60 + now.getMinutes();
 
-  const meta = dbGet('SELECT value FROM meta WHERE key = ?', ['lastAttendanceDate']);
-  if (meta && meta.value === today) return;
+  // 快取：同實例 2 分鐘內已處理過 → skip
+  if (__ensureCache.date === today && (Date.now() - __ensureCache.at) < 120000) return;
 
-  const shiftCfg = {
-    morning:   { startH:9, endH:18, earlyBase:8 },
-    afternoon: { startH:14, endH:22, earlyBase:13 },
-    night:     { startH:22, endH:6, earlyBase:21 }
+  const SHIFT_PUNCH = {
+    morning:   { clockIn: '08:55', clockOut: '18:05', endH: 18 },
+    afternoon: { clockIn: '13:55', clockOut: '22:05', endH: 22 },
+    night:     { clockIn: '21:55', clockOut: '06:05', endH: 6 },
   };
 
-  const weeklyLate  = { 1:[3,10], 2:[5,7], 3:[4,9], 4:[2,6], 5:[8,3] };
-  const weeklyEarly = { 1:[7,12], 2:[4,11], 3:[6,8], 4:[5,10], 5:[2,9] };
-  const lateMinPool  = [12, 18, 7, 25, 15, 9, 22, 5, 30, 14, 8, 20];
-  const earlyMinPool = [10, 15, 22, 8, 18, 12, 25, 6, 20, 14, 9, 17];
+  // 一次查出今天所有已存在 attendance 的 user_id，避免 N+1
+  const existingRows = await dbAll('SELECT user_id FROM attendance WHERE date = ?', [today]);
+  const existsSet = new Set(existingRows.map(r => r.user_id));
 
-  const dayOfWeek = now.getDay();
-  const dayOfMonth = now.getDate();
-  const todayLate = weeklyLate[dayOfWeek] || [];
-  const todayEarly = weeklyEarly[dayOfWeek] || [];
-
-  const activeUsers = dbAll('SELECT * FROM users WHERE status = ?', ['active']);
+  // 除了 admin 以外的啟用員工
+  const activeUsers = await dbAll("SELECT * FROM users WHERE status = 'active' AND role != 'admin'");
 
   for (const u of activeUsers) {
     if (u.id === excludeUserId) continue;
-    const existing = dbGet('SELECT id FROM attendance WHERE user_id = ? AND date = ?', [u.id, today]);
-    if (existing) continue;
+    if (existsSet.has(u.id)) continue;
 
     const shift = UID_SHIFT_MAP[u.id] || 'morning';
-    const cfg = shiftCfg[shift];
-    const shiftStartMin = cfg.startH * 60;
-    const shiftEndMin = cfg.endH * 60;
-    const crossesMidnight = shiftEndMin < shiftStartMin;
+    const cfg = SHIFT_PUNCH[shift];
+    const [ciH, ciM] = cfg.clockIn.split(':').map(Number);
+    const clockInMin = ciH * 60 + ciM;
 
-    if (crossesMidnight) {
-      if (nowMin < shiftStartMin - 15 && nowMin > shiftEndMin) continue;
-    } else {
-      if (nowMin < shiftStartMin - 15) continue;
+    // 還沒到上班時間 → 不補 (讓 UI 顯示「待上班」)
+    if (nowMin < clockInMin) continue;
+
+    // 判斷是否已下班
+    let clockOut = null;
+    if (shift !== 'night') {
+      if (nowMin >= cfg.endH * 60 + 5) clockOut = cfg.clockOut;
     }
+    // 夜班 record 的 clockOut 屬於隔日，這個函式只寫 today，所以保持 null
 
-    const isLate = todayLate.includes(u.id);
-    const isEarly = todayEarly.includes(u.id);
-    let clockIn, clockOut = null, status = 'normal', lateMins = 0, earlyMins = 0;
-
-    if (isLate) {
-      lateMins = lateMinPool[(u.id + dayOfMonth) % lateMinPool.length];
-      clockIn = minToTime(cfg.startH * 60 + lateMins);
-      status = 'late';
-    } else {
-      const offset = ((u.id * 7 + dayOfMonth * 3) % 14) + 1;
-      clockIn = minToTime(cfg.earlyBase * 60 + 60 - offset);
-    }
-
-    const [ciH, ciM] = clockIn.split(':').map(Number);
-    if (ciH * 60 + ciM > nowMin) continue;
-
-    const shiftEnded = crossesMidnight
-      ? (nowMin > shiftEndMin && nowMin < shiftStartMin)
-      : (nowMin > shiftEndMin);
-
-    if (shiftEnded) {
-      if (isEarly) {
-        earlyMins = earlyMinPool[(u.id + dayOfMonth) % earlyMinPool.length];
-        clockOut = minToTime(cfg.endH * 60 - earlyMins);
-        status = status === 'late' ? 'late+early' : 'early';
-      } else {
-        clockOut = `${pad2(cfg.endH)}:${pad2(((u.id * 3 + dayOfMonth) % 12) + 1)}`;
-      }
-    }
-
-    dbRun('INSERT INTO attendance (user_id, date, clock_in, clock_out, status, late_minutes, early_leave_minutes, shift) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-      [u.id, today, clockIn, clockOut, status, lateMins, earlyMins, shift]);
+    await dbRun(
+      'INSERT INTO attendance (user_id, date, clock_in, clock_out, status, late_minutes, early_leave_minutes, shift) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      [u.id, today, cfg.clockIn, clockOut, 'normal', 0, 0, shift]
+    );
+    existsSet.add(u.id);
   }
 
-  dbRun('INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)', ['lastAttendanceDate', today]);
-  saveDatabase();
+  __ensureCache = { date: today, at: Date.now() };
 }
 
 // ============================================================
@@ -565,7 +526,7 @@ function authMiddleware(req, res, next) {
   }
 }
 
-app.use('/api', (req, res, next) => {
+app.use('/api', async (req, res, next) => {
   if (req.path === '/auth/login') return next();
   authMiddleware(req, res, next);
 });
@@ -575,7 +536,7 @@ app.use('/api', (req, res, next) => {
 // ============================================================
 
 // ---------- AUTH ----------
-app.post('/api/auth/login', (req, res) => {
+app.post('/api/auth/login', async (req, res) => {
   const { username, password } = req.body;
   if (!username || !password) {
     return res.status(400).json({ error: '請提供帳號與密碼' });
@@ -583,9 +544,9 @@ app.post('/api/auth/login', (req, res) => {
 
   let user;
   if (username === 'admin') {
-    user = dbGet('SELECT * FROM users WHERE role = ? AND status = ?', ['admin', 'active']);
+    user = await dbGet('SELECT * FROM users WHERE role = ? AND status = ?', ['admin', 'active']);
   } else {
-    user = dbGet('SELECT * FROM users WHERE (employee_id = ? OR email = ?) AND status = ?', [username, username, 'active']);
+    user = await dbGet('SELECT * FROM users WHERE (employee_id = ? OR email = ?) AND status = ?', [username, username, 'active']);
   }
 
   if (!user) {
@@ -596,7 +557,7 @@ app.post('/api/auth/login', (req, res) => {
     return res.status(401).json({ error: '帳號或密碼錯誤' });
   }
 
-  ensureTodayAttendance(user.id);
+  await ensureTodayAttendance(user.id);
 
   const token = jwt.sign({ id: user.id, role: user.role }, JWT_SECRET, { expiresIn: '24h' });
 
@@ -607,11 +568,16 @@ app.post('/api/auth/login', (req, res) => {
 });
 
 // ---------- ATTENDANCE ----------
-app.get('/api/attendance', (req, res) => {
+app.get('/api/attendance', async (req, res) => {
   const dateStr = req.query.date || todayStr();
-  let records = dbAll('SELECT * FROM attendance WHERE date = ?', [dateStr]);
+  let records = await dbAll('SELECT * FROM attendance WHERE date = ?', [dateStr]);
 
-  const activeUsers = dbAll('SELECT * FROM users WHERE status = ?', ['active']);
+  const activeUsers = await dbAll('SELECT * FROM users WHERE status = ?', ['active']);
+  // 一次抓當天所有排班, 避免 N+1 (每個員工查一次)
+  const scheduleRows = await dbAll('SELECT user_id, shift_type FROM schedules WHERE date = ?', [dateStr]);
+  const schedMap = {};
+  for (const s of scheduleRows) schedMap[s.user_id] = s.shift_type;
+
   const result = records.map(attendanceToJSON);
 
   for (const u of activeUsers) {
@@ -625,7 +591,7 @@ app.get('/api/attendance', (req, res) => {
         status: 'absent',
         lateMinutes: 0,
         earlyLeaveMinutes: 0,
-        shift: getUserShift(u.id, dateStr)
+        shift: schedMap[u.id] || UID_SHIFT_MAP[u.id] || 'morning'
       });
     }
   }
@@ -635,33 +601,33 @@ app.get('/api/attendance', (req, res) => {
   res.json({
     records: result,
     users: activeUsers.map(userToJSON),
-    departments: dbAll('SELECT * FROM departments').map(departmentToJSON)
+    departments: (await dbAll('SELECT * FROM departments')).map(departmentToJSON)
   });
 });
 
-app.post('/api/attendance/clockin', (req, res) => {
+app.post('/api/attendance/clockin', async (req, res) => {
   const userId = req.user.id;
   const today = todayStr();
 
-  const existing = dbGet('SELECT * FROM attendance WHERE user_id = ? AND date = ?', [userId, today]);
+  const existing = await dbGet('SELECT * FROM attendance WHERE user_id = ? AND date = ?', [userId, today]);
   if (existing) {
     return res.status(400).json({ error: '今日已打卡上班' });
   }
 
   const now = new Date();
   const timeStr = `${pad2(now.getHours())}:${pad2(now.getMinutes())}`;
-  const shift = getUserShift(userId, today);
+  const shift = await getUserShift(userId, today);
   const cfg = SHIFT_TIMES[shift];
   const workStartMin = cfg.startH * 60 + 10;
   const nowMin = now.getHours() * 60 + now.getMinutes();
   const isLate = nowMin > workStartMin;
   const lateMins = isLate ? nowMin - cfg.startH * 60 : 0;
 
-  dbRun('INSERT INTO attendance (user_id, date, clock_in, clock_out, status, late_minutes, early_leave_minutes, shift) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+  await dbRun('INSERT INTO attendance (user_id, date, clock_in, clock_out, status, late_minutes, early_leave_minutes, shift) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
     [userId, today, timeStr, null, isLate ? 'late' : 'normal', lateMins, 0, shift]);
   saveDatabase();
 
-  const record = dbGet('SELECT * FROM attendance WHERE user_id = ? AND date = ?', [userId, today]);
+  const record = await dbGet('SELECT * FROM attendance WHERE user_id = ? AND date = ?', [userId, today]);
 
   res.json({
     record: attendanceToJSON(record),
@@ -670,11 +636,11 @@ app.post('/api/attendance/clockin', (req, res) => {
   });
 });
 
-app.post('/api/attendance/clockout', (req, res) => {
+app.post('/api/attendance/clockout', async (req, res) => {
   const userId = req.user.id;
   const today = todayStr();
 
-  const record = dbGet('SELECT * FROM attendance WHERE user_id = ? AND date = ?', [userId, today]);
+  const record = await dbGet('SELECT * FROM attendance WHERE user_id = ? AND date = ?', [userId, today]);
   if (!record) {
     return res.status(400).json({ error: '尚未打卡上班' });
   }
@@ -684,7 +650,7 @@ app.post('/api/attendance/clockout', (req, res) => {
 
   const now = new Date();
   const timeStr = `${pad2(now.getHours())}:${pad2(now.getMinutes())}`;
-  const shift = record.shift || getUserShift(userId, today);
+  const shift = record.shift || await getUserShift(userId, today);
   const cfg = SHIFT_TIMES[shift];
   const nowMin = now.getHours() * 60 + now.getMinutes();
   const endMin = cfg.endH * 60;
@@ -696,11 +662,11 @@ app.post('/api/attendance/clockout', (req, res) => {
     newStatus = record.status === 'late' ? 'late+early' : 'early';
   }
 
-  dbRun('UPDATE attendance SET clock_out = ?, early_leave_minutes = ?, status = ? WHERE id = ?',
+  await dbRun('UPDATE attendance SET clock_out = ?, early_leave_minutes = ?, status = ? WHERE id = ?',
     [timeStr, earlyMins, newStatus, record.id]);
   saveDatabase();
 
-  const updated = dbGet('SELECT * FROM attendance WHERE id = ?', [record.id]);
+  const updated = await dbGet('SELECT * FROM attendance WHERE id = ?', [record.id]);
 
   res.json({
     record: attendanceToJSON(updated),
@@ -710,20 +676,20 @@ app.post('/api/attendance/clockout', (req, res) => {
 });
 
 // ---------- LEAVES ----------
-app.get('/api/leaves', (req, res) => {
-  const user = dbGet('SELECT * FROM users WHERE id = ?', [req.user.id]);
+app.get('/api/leaves', async (req, res) => {
+  const user = await dbGet('SELECT * FROM users WHERE id = ?', [req.user.id]);
   const isManagerOrAdmin = user.role === 'admin' || user.role === 'manager';
   let leaves;
   if (isManagerOrAdmin) {
-    leaves = dbAll('SELECT * FROM leaves ORDER BY id DESC');
+    leaves = await dbAll('SELECT * FROM leaves ORDER BY id DESC');
   } else {
-    leaves = dbAll('SELECT * FROM leaves WHERE user_id = ? ORDER BY id DESC', [req.user.id]);
+    leaves = await dbAll('SELECT * FROM leaves WHERE user_id = ? ORDER BY id DESC', [req.user.id]);
   }
-  const users = dbAll('SELECT * FROM users').map(userToJSON);
+  const users = (await dbAll('SELECT * FROM users')).map(userToJSON);
   res.json({ leaves: leaves.map(leaveToJSON), users, isManager: isManagerOrAdmin });
 });
 
-app.post('/api/leaves', (req, res) => {
+app.post('/api/leaves', async (req, res) => {
   const { type, startDate, endDate, reason } = req.body;
   if (!type || !startDate || !endDate || !reason) {
     return res.status(400).json({ error: '請填寫完整資訊' });
@@ -732,26 +698,26 @@ app.post('/api/leaves', (req, res) => {
     return res.status(400).json({ error: '結束日期不可早於開始日期' });
   }
 
-  dbRun('INSERT INTO leaves (user_id, type, start_date, end_date, reason, status, approved_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+  await dbRun('INSERT INTO leaves (user_id, type, start_date, end_date, reason, status, approved_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
     [req.user.id, type, startDate, endDate, reason, 'pending', null, todayStr()]);
   saveDatabase();
 
   res.json({ message: '請假申請已送出' });
 });
 
-app.put('/api/leaves/:id', (req, res) => {
+app.put('/api/leaves/:id', async (req, res) => {
   const { status } = req.body;
   const leaveId = parseInt(req.params.id);
-  const leave = dbGet('SELECT * FROM leaves WHERE id = ?', [leaveId]);
+  const leave = await dbGet('SELECT * FROM leaves WHERE id = ?', [leaveId]);
   if (!leave) return res.status(404).json({ error: '找不到此請假記錄' });
 
-  dbRun('UPDATE leaves SET status = ?, approved_by = ? WHERE id = ?', [status, req.user.id, leaveId]);
+  await dbRun('UPDATE leaves SET status = ?, approved_by = ? WHERE id = ?', [status, req.user.id, leaveId]);
 
   if (status === 'approved') {
     const days = Math.ceil((new Date(leave.end_date) - new Date(leave.start_date)) / 86400000) + 1;
-    const bal = dbGet('SELECT * FROM leave_balances WHERE user_id = ? AND leave_type = ?', [leave.user_id, leave.type]);
+    const bal = await dbGet('SELECT * FROM leave_balances WHERE user_id = ? AND leave_type = ?', [leave.user_id, leave.type]);
     if (bal) {
-      dbRun('UPDATE leave_balances SET used_days = used_days + ? WHERE id = ?', [days, bal.id]);
+      await dbRun('UPDATE leave_balances SET used_days = used_days + ? WHERE id = ?', [days, bal.id]);
     }
   }
 
@@ -760,47 +726,47 @@ app.put('/api/leaves/:id', (req, res) => {
 });
 
 // ---------- OVERTIME ----------
-app.get('/api/overtime', (req, res) => {
-  const user = dbGet('SELECT * FROM users WHERE id = ?', [req.user.id]);
+app.get('/api/overtime', async (req, res) => {
+  const user = await dbGet('SELECT * FROM users WHERE id = ?', [req.user.id]);
   const isManagerOrAdmin = user.role === 'admin' || user.role === 'manager';
   let ots;
   if (isManagerOrAdmin) {
-    ots = dbAll('SELECT * FROM overtime ORDER BY id DESC');
+    ots = await dbAll('SELECT * FROM overtime ORDER BY id DESC');
   } else {
-    ots = dbAll('SELECT * FROM overtime WHERE user_id = ? ORDER BY id DESC', [req.user.id]);
+    ots = await dbAll('SELECT * FROM overtime WHERE user_id = ? ORDER BY id DESC', [req.user.id]);
   }
-  const users = dbAll('SELECT * FROM users').map(userToJSON);
+  const users = (await dbAll('SELECT * FROM users')).map(userToJSON);
   res.json({ overtime: ots.map(overtimeToJSON), users, isManager: isManagerOrAdmin });
 });
 
-app.post('/api/overtime', (req, res) => {
+app.post('/api/overtime', async (req, res) => {
   const { date, hours, reason } = req.body;
   if (!date || !hours || !reason) {
     return res.status(400).json({ error: '請填寫完整資訊' });
   }
 
-  dbRun('INSERT INTO overtime (user_id, date, hours, reason, status, approved_by) VALUES (?, ?, ?, ?, ?, ?)',
+  await dbRun('INSERT INTO overtime (user_id, date, hours, reason, status, approved_by) VALUES (?, ?, ?, ?, ?, ?)',
     [req.user.id, date, hours, reason, 'pending', null]);
   saveDatabase();
 
   res.json({ message: '加班申請已送出' });
 });
 
-app.put('/api/overtime/:id', (req, res) => {
+app.put('/api/overtime/:id', async (req, res) => {
   const { status } = req.body;
   const otId = parseInt(req.params.id);
 
-  dbRun('UPDATE overtime SET status = ?, approved_by = ? WHERE id = ?', [status, req.user.id, otId]);
+  await dbRun('UPDATE overtime SET status = ?, approved_by = ? WHERE id = ?', [status, req.user.id, otId]);
   saveDatabase();
 
   res.json({ message: status === 'approved' ? '已核准加班' : '已拒絕加班' });
 });
 
 // ---------- EMPLOYEES ----------
-app.get('/api/employees', (req, res) => {
-  const users = dbAll('SELECT * FROM users ORDER BY id ASC');
-  const departments = dbAll('SELECT * FROM departments');
-  const maxId = dbGet('SELECT MAX(id) as maxId FROM users');
+app.get('/api/employees', async (req, res) => {
+  const users = await dbAll('SELECT * FROM users ORDER BY id ASC');
+  const departments = await dbAll('SELECT * FROM departments');
+  const maxId = await dbGet('SELECT MAX(id) as maxId FROM users');
   const nextId = (maxId && maxId.maxId ? maxId.maxId : 0) + 1;
   res.json({
     users: users.map(userToJSON),
@@ -809,54 +775,54 @@ app.get('/api/employees', (req, res) => {
   });
 });
 
-app.post('/api/employees', (req, res) => {
+app.post('/api/employees', async (req, res) => {
   const { employeeId, name, email, password, departmentId, role, salary, hireDate } = req.body;
   if (!name || !email) {
     return res.status(400).json({ error: '請填寫完整資訊' });
   }
 
   const hashed = bcrypt.hashSync(password || '123456', 10);
-  const result = dbRun('INSERT INTO users (employee_id, name, email, password, department_id, role, salary, status, hire_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+  const result = await dbRun('INSERT INTO users (employee_id, name, email, password, department_id, role, salary, status, hire_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
     [employeeId, name, email, hashed, departmentId, role || 'employee', salary || 40000, 'active', hireDate || todayStr()]);
 
   const year = new Date().getFullYear();
   const types = ['特休','病假','事假','婚','喪假'];
   const days = [7, 30, 14, 8, 8];
-  types.forEach((t, i) => {
-    dbRun('INSERT INTO leave_balances (user_id, leave_type, total_days, used_days, year) VALUES (?, ?, ?, ?, ?)',
-      [result.lastInsertRowid, t, days[i], 0, year]);
-  });
+  for (let i = 0; i < types.length; i++) {
+    await dbRun('INSERT INTO leave_balances (user_id, leave_type, total_days, used_days, year) VALUES (?, ?, ?, ?, ?)',
+      [result.lastInsertRowid, types[i], days[i], 0, year]);
+  }
 
   saveDatabase();
   res.json({ message: '員工已新增', id: result.lastInsertRowid });
 });
 
-app.put('/api/employees/:id', (req, res) => {
+app.put('/api/employees/:id', async (req, res) => {
   const userId = parseInt(req.params.id);
   const { employeeId, name, email, password, departmentId, role, salary, hireDate, status } = req.body;
 
   if (status !== undefined) {
-    dbRun('UPDATE users SET status = ? WHERE id = ?', [status, userId]);
+    await dbRun('UPDATE users SET status = ? WHERE id = ?', [status, userId]);
     saveDatabase();
-    const u = dbGet('SELECT * FROM users WHERE id = ?', [userId]);
+    const u = await dbGet('SELECT * FROM users WHERE id = ?', [userId]);
     return res.json({ message: `已${status === 'active' ? '啟用' : '停用'} ${u.name}`, user: userToJSON(u) });
   }
 
   if (password) {
     const hashed = bcrypt.hashSync(password, 10);
     if (employeeId) {
-      dbRun('UPDATE users SET employee_id = ?, name = ?, email = ?, department_id = ?, role = ?, salary = ?, hire_date = ?, password = ? WHERE id = ?',
+      await dbRun('UPDATE users SET employee_id = ?, name = ?, email = ?, department_id = ?, role = ?, salary = ?, hire_date = ?, password = ? WHERE id = ?',
         [employeeId, name, email, departmentId, role, salary, hireDate, hashed, userId]);
     } else {
-      dbRun('UPDATE users SET name = ?, email = ?, department_id = ?, role = ?, salary = ?, hire_date = ?, password = ? WHERE id = ?',
+      await dbRun('UPDATE users SET name = ?, email = ?, department_id = ?, role = ?, salary = ?, hire_date = ?, password = ? WHERE id = ?',
         [name, email, departmentId, role, salary, hireDate, hashed, userId]);
     }
   } else {
     if (employeeId) {
-      dbRun('UPDATE users SET employee_id = ?, name = ?, email = ?, department_id = ?, role = ?, salary = ?, hire_date = ? WHERE id = ?',
+      await dbRun('UPDATE users SET employee_id = ?, name = ?, email = ?, department_id = ?, role = ?, salary = ?, hire_date = ? WHERE id = ?',
         [employeeId, name, email, departmentId, role, salary, hireDate, userId]);
     } else {
-      dbRun('UPDATE users SET name = ?, email = ?, department_id = ?, role = ?, salary = ?, hire_date = ? WHERE id = ?',
+      await dbRun('UPDATE users SET name = ?, email = ?, department_id = ?, role = ?, salary = ?, hire_date = ? WHERE id = ?',
         [name, email, departmentId, role, salary, hireDate, userId]);
     }
   }
@@ -866,9 +832,9 @@ app.put('/api/employees/:id', (req, res) => {
 });
 
 // ---------- DEPARTMENTS ----------
-app.get('/api/departments', (req, res) => {
-  const departments = dbAll('SELECT * FROM departments');
-  const users = dbAll('SELECT * FROM users WHERE status = ?', ['active']);
+app.get('/api/departments', async (req, res) => {
+  const departments = await dbAll('SELECT * FROM departments');
+  const users = await dbAll('SELECT * FROM users WHERE status = ?', ['active']);
   res.json({
     departments: departments.map(d => {
       const dept = departmentToJSON(d);
@@ -879,57 +845,57 @@ app.get('/api/departments', (req, res) => {
   });
 });
 
-app.post('/api/departments', (req, res) => {
+app.post('/api/departments', async (req, res) => {
   const { name, managerId } = req.body;
   if (!name) return res.status(400).json({ error: '請輸入部門名稱' });
 
-  dbRun('INSERT INTO departments (name, manager_id) VALUES (?, ?)', [name, managerId || null]);
+  await dbRun('INSERT INTO departments (name, manager_id) VALUES (?, ?)', [name, managerId || null]);
   saveDatabase();
   res.json({ message: '部門已新增' });
 });
 
-app.put('/api/departments/:id', (req, res) => {
+app.put('/api/departments/:id', async (req, res) => {
   const { name, managerId } = req.body;
   if (!name) return res.status(400).json({ error: '請輸入部門名稱' });
 
-  dbRun('UPDATE departments SET name = ?, manager_id = ? WHERE id = ?', [name, managerId || null, parseInt(req.params.id)]);
+  await dbRun('UPDATE departments SET name = ?, manager_id = ? WHERE id = ?', [name, managerId || null, parseInt(req.params.id)]);
   saveDatabase();
   res.json({ message: '部門已更新' });
 });
 
 // ---------- ANNOUNCEMENTS ----------
-app.get('/api/announcements', (req, res) => {
-  const anns = dbAll('SELECT * FROM announcements ORDER BY pinned DESC, created_at DESC');
-  const users = dbAll('SELECT * FROM users').map(userToJSON);
+app.get('/api/announcements', async (req, res) => {
+  const anns = await dbAll('SELECT * FROM announcements ORDER BY pinned DESC, created_at DESC');
+  const users = (await dbAll('SELECT * FROM users')).map(userToJSON);
   res.json({ announcements: anns.map(announcementToJSON), users });
 });
 
-app.post('/api/announcements', (req, res) => {
+app.post('/api/announcements', async (req, res) => {
   const { title, content, pinned } = req.body;
   if (!title || !content) return res.status(400).json({ error: '請填寫完整資訊' });
 
-  dbRun('INSERT INTO announcements (title, content, author_id, created_at, pinned) VALUES (?, ?, ?, ?, ?)',
+  await dbRun('INSERT INTO announcements (title, content, author_id, created_at, pinned) VALUES (?, ?, ?, ?, ?)',
     [title, content, req.user.id, new Date().toISOString(), pinned ? 1 : 0]);
   saveDatabase();
   res.json({ message: '公告已發布' });
 });
 
-app.delete('/api/announcements/:id', (req, res) => {
-  dbRun('DELETE FROM announcements WHERE id = ?', [parseInt(req.params.id)]);
+app.delete('/api/announcements/:id', async (req, res) => {
+  await dbRun('DELETE FROM announcements WHERE id = ?', [parseInt(req.params.id)]);
   saveDatabase();
   res.json({ message: '公告已刪除' });
 });
 
 // ---------- SCHEDULES ----------
-app.get('/api/schedules', (req, res) => {
+app.get('/api/schedules', async (req, res) => {
   const now = new Date();
   const weekStart = new Date(now);
   weekStart.setDate(now.getDate() - (now.getDay() === 0 ? 6 : now.getDay() - 1));
   const weekEnd = new Date(weekStart);
   weekEnd.setDate(weekStart.getDate() + 6);
 
-  const schedules = dbAll('SELECT * FROM schedules WHERE date >= ? AND date <= ?', [fmtDate(weekStart), fmtDate(weekEnd)]);
-  const users = dbAll('SELECT * FROM users WHERE status = ?', ['active']);
+  const schedules = await dbAll('SELECT * FROM schedules WHERE date >= ? AND date <= ?', [fmtDate(weekStart), fmtDate(weekEnd)]);
+  const users = await dbAll('SELECT * FROM users WHERE status = ?', ['active']);
 
   res.json({
     schedules: schedules.map(scheduleToJSON),
@@ -939,15 +905,15 @@ app.get('/api/schedules', (req, res) => {
   });
 });
 
-app.post('/api/schedules', (req, res) => {
+app.post('/api/schedules', async (req, res) => {
   const { userId, date, shiftType } = req.body;
   if (!userId || !date || !shiftType) return res.status(400).json({ error: '請填寫完整資訊' });
 
-  const existing = dbGet('SELECT * FROM schedules WHERE user_id = ? AND date = ?', [userId, date]);
+  const existing = await dbGet('SELECT * FROM schedules WHERE user_id = ? AND date = ?', [userId, date]);
   if (existing) {
-    dbRun('UPDATE schedules SET shift_type = ? WHERE id = ?', [shiftType, existing.id]);
+    await dbRun('UPDATE schedules SET shift_type = ? WHERE id = ?', [shiftType, existing.id]);
   } else {
-    dbRun('INSERT INTO schedules (user_id, date, shift_type) VALUES (?, ?, ?)', [userId, date, shiftType]);
+    await dbRun('INSERT INTO schedules (user_id, date, shift_type) VALUES (?, ?, ?)', [userId, date, shiftType]);
   }
 
   saveDatabase();
@@ -955,7 +921,7 @@ app.post('/api/schedules', (req, res) => {
 });
 
 // ---------- SALARY ----------
-app.get('/api/salary', (req, res) => {
+app.get('/api/salary', async (req, res) => {
   const monthStr = req.query.month || `${new Date().getFullYear()}-${pad2(new Date().getMonth() + 1)}`;
   const [year, month] = monthStr.split('-').map(Number);
   const daysInMonth = new Date(year, month, 0).getDate();
@@ -966,15 +932,16 @@ app.get('/api/salary', (req, res) => {
     if (date.getDay() !== 0 && date.getDay() !== 6) workDays++;
   }
 
-  const users = dbAll('SELECT * FROM users WHERE status = ?', ['active']);
+  const users = await dbAll('SELECT * FROM users WHERE status = ?', ['active']);
   const overtimeRate = 1.33;
 
-  const rows = users.map(u => {
-    const monthRecords = dbAll('SELECT * FROM attendance WHERE user_id = ? AND date LIKE ?', [u.id, monthStr + '%']);
+  const rows = [];
+  for (const u of users) {
+    const monthRecords = await dbAll('SELECT * FROM attendance WHERE user_id = ? AND date LIKE ?', [u.id, monthStr + '%']);
     const lateMins = monthRecords.reduce((s, r) => s + (r.late_minutes || 0), 0);
     const earlyMins = monthRecords.reduce((s, r) => s + (r.early_leave_minutes || 0), 0);
     const absentDays = workDays - monthRecords.length;
-    const otRecords = dbAll('SELECT * FROM overtime WHERE user_id = ? AND date LIKE ? AND status = ?', [u.id, monthStr + '%', 'approved']);
+    const otRecords = await dbAll('SELECT * FROM overtime WHERE user_id = ? AND date LIKE ? AND status = ?', [u.id, monthStr + '%', 'approved']);
     const otHours = otRecords.reduce((s, o) => s + o.hours, 0);
 
     const dailyRate = u.salary / workDays;
@@ -985,7 +952,7 @@ app.get('/api/salary', (req, res) => {
     const otPay = Math.round(otHours * hourlyRate * overtimeRate);
     const totalPay = Math.round(u.salary - latePenalty - earlyPenalty - absentDeduct + otPay) || 0;
 
-    return {
+    rows.push({
       ...userToJSON(u),
       attendDays: monthRecords.length,
       lateMins,
@@ -997,19 +964,19 @@ app.get('/api/salary', (req, res) => {
       absentDeduct,
       otPay,
       totalPay
-    };
-  });
+    });
+  }
 
   res.json({ rows, workDays, overtimeRate });
 });
 
 // ---------- REPORTS ----------
-app.get('/api/reports', (req, res) => {
+app.get('/api/reports', async (req, res) => {
   const monthStr = req.query.month || `${new Date().getFullYear()}-${pad2(new Date().getMonth() + 1)}`;
 
-  const departments = dbAll('SELECT * FROM departments');
-  const users = dbAll('SELECT * FROM users WHERE status = ?', ['active']);
-  const allRecords = dbAll('SELECT * FROM attendance WHERE date LIKE ?', [monthStr + '%']);
+  const departments = await dbAll('SELECT * FROM departments');
+  const users = await dbAll('SELECT * FROM users WHERE status = ?', ['active']);
+  const allRecords = await dbAll('SELECT * FROM attendance WHERE date LIKE ?', [monthStr + '%']);
 
   const deptStats = departments.map(d => {
     const deptUsers = users.filter(u => u.department_id === d.id);
@@ -1047,40 +1014,48 @@ app.get('/api/reports', (req, res) => {
 });
 
 // ---------- LEAVE BALANCES ----------
-app.get('/api/leave-balances', (req, res) => {
+app.get('/api/leave-balances', async (req, res) => {
   const userId = req.query.userId || req.user.id;
-  const balances = dbAll('SELECT * FROM leave_balances WHERE user_id = ?', [userId]);
+  const balances = await dbAll('SELECT * FROM leave_balances WHERE user_id = ?', [userId]);
   res.json({ balances: balances.map(leaveBalanceToJSON) });
 });
 
 // ---------- DASHBOARD ----------
-app.get('/api/dashboard', (req, res) => {
+app.get('/api/dashboard', async (req, res) => {
   const today = todayStr();
-  const todayRecords = dbAll('SELECT * FROM attendance WHERE date = ?', [today]);
-  const activeUsersRow = dbGet('SELECT COUNT(*) as count FROM users WHERE status = ?', ['active']);
+  const todayRecords = await dbAll('SELECT * FROM attendance WHERE date = ?', [today]);
+  const activeUsersRow = await dbGet('SELECT COUNT(*) as count FROM users WHERE status = ?', ['active']);
   const activeUsers = activeUsersRow ? activeUsersRow.count : 0;
   const clockedIn = todayRecords.length;
   const lateCount = todayRecords.filter(a => a.status.includes('late')).length;
-  const pendingLeavesRow = dbGet('SELECT COUNT(*) as count FROM leaves WHERE status = ?', ['pending']);
+  // 計算待審核：排除自己送出的 (避免自己申請後 sidebar 出現紅點提醒自己審自己)
+  const pendingLeavesRow = await dbGet('SELECT COUNT(*) as count FROM leaves WHERE status = ? AND user_id != ?', ['pending', req.user.id]);
   const pendingLeaves = pendingLeavesRow ? pendingLeavesRow.count : 0;
-  const pendingOTRow = dbGet('SELECT COUNT(*) as count FROM overtime WHERE status = ?', ['pending']);
+  const pendingOTRow = await dbGet('SELECT COUNT(*) as count FROM overtime WHERE status = ? AND user_id != ?', ['pending', req.user.id]);
   const pendingOT = pendingOTRow ? pendingOTRow.count : 0;
   const pendingTotal = pendingLeaves + pendingOT;
 
   const myRecord = todayRecords.find(a => a.user_id === req.user.id);
 
-  const announcements = dbAll('SELECT * FROM announcements ORDER BY pinned DESC, created_at DESC LIMIT 2').map(announcementToJSON);
-  const users = dbAll('SELECT * FROM users').map(userToJSON);
+  const announcements = (await dbAll('SELECT * FROM announcements ORDER BY pinned DESC, created_at DESC')).map(announcementToJSON);
+  const users = (await dbAll('SELECT * FROM users')).map(userToJSON);
 
+  // 圖表：一次查出本月出勤統計 (避免 N+1 往返雲端 DB)
   const now = new Date();
   const year = now.getFullYear(), month = now.getMonth();
+  const monthPrefix = `${year}-${pad2(month + 1)}`;
+  const monthRows = await dbAll(
+    'SELECT date, COUNT(*) as count FROM attendance WHERE date LIKE ? GROUP BY date',
+    [monthPrefix + '%']
+  );
+  const countByDate = {};
+  for (const r of monthRows) countByDate[r.date] = r.count;
   const chartDays = [];
   for (let d = 1; d <= now.getDate(); d++) {
     const date = new Date(year, month, d);
     if (date.getDay() === 0 || date.getDay() === 6) continue;
     const dateStr = fmtDate(date);
-    const countRow = dbGet('SELECT COUNT(*) as count FROM attendance WHERE date = ?', [dateStr]);
-    chartDays.push({ label: d, count: countRow ? countRow.count : 0 });
+    chartDays.push({ label: d, count: countByDate[dateStr] || 0 });
   }
 
   res.json({
@@ -1097,42 +1072,97 @@ app.get('/api/dashboard', (req, res) => {
   });
 });
 
+// ---------- DEMO RESET (admin only) ----------
+// 點一下就把 DB 洗回初始展示狀態, 用在給人看的 demo 情境
+app.post('/api/admin/reset-demo', async (req, res) => {
+  if (req.user.role !== 'admin') {
+    return res.status(403).json({ error: '僅系統管理員可使用' });
+  }
+  try {
+    await reseedDemoData({ dbRun: async (sql, args) => await dbRun(sql, args) });
+    // 清掉 ensureTodayAttendance 的記憶體 cache, 讓下次登入不會被跳過
+    __ensureCache = { date: null, at: 0 };
+    res.json({ message: '展示資料已重置' });
+  } catch (e) {
+    console.error('reset-demo failed:', e);
+    res.status(500).json({ error: '重置失敗: ' + e.message });
+  }
+});
+
 // ============================================================
 // FALLBACK: Serve index.html
 // ============================================================
-app.get('*', (req, res) => {
+app.get('*', async (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
 // ============================================================
-// START SERVER (async because sql.js needs async init)
+// DEMO RESET — 純展示模式用
 // ============================================================
-async function startServer() {
-  const SQL = await initSqlJs();
+// 在 Vercel serverless 模式下，每次冷啟動載入 DB 後呼叫一次。
+// 目的：不管磁碟上的 hr_system.db 累積了多少髒資料，每個新函式
+// 實例都從乾淨狀態開始，避免「剛登入就看到以前的打卡 / 請假 / 加班」。
+async function resetDemoState() {
+  try {
+    // 1. 清空系統管理員 (id=1) 的所有出勤紀錄
+    await dbRun('DELETE FROM attendance WHERE user_id = 1');
 
-  // Load existing DB or create new one
-  if (fs.existsSync(DB_PATH)) {
-    const fileBuffer = fs.readFileSync(DB_PATH);
-    db = new SQL.Database(fileBuffer);
-    console.log('Loaded existing database.');
-  } else {
-    db = new SQL.Database();
-    console.log('Created new database.');
+    // 2. 清空所有請假申請 (讓展示畫面維持「全新未使用」的狀態)
+    await dbRun('DELETE FROM leaves');
+
+    // 3. 清空所有加班申請
+    await dbRun('DELETE FROM overtime');
+
+    console.log('Demo state reset: admin attendance / leaves / overtime cleared.');
+  } catch (err) {
+    console.error('resetDemoState failed:', err);
   }
-
-  createTables();
-  seedDatabase();
-
-  // Save on exit
-  process.on('SIGINT', () => { saveDatabase(); process.exit(0); });
-  process.on('SIGTERM', () => { saveDatabase(); process.exit(0); });
-
-  app.listen(PORT, () => {
-    console.log(`DUCK HR System running at http://localhost:${PORT}`);
-  });
 }
 
-startServer().catch(err => {
-  console.error('Failed to start server:', err);
-  process.exit(1);
-});
+// ============================================================
+// DATABASE INITIALIZATION (shared by local & serverless)
+// ============================================================
+async function initializeDatabase() {
+  // libsql client 是 lazy-init，只要 getDb() 被呼叫就建好連線
+  getDb();
+  console.log('Connected to libsql:', dbUrl.startsWith('libsql://') ? 'Turso (cloud)' : dbUrl);
+
+  await createTables();
+  await seedDatabase();
+  // 有真實雲端 DB (Turso) 後, 資料會持久化, 不再需要冷啟動清洗。
+}
+
+// ============================================================
+// SERVERLESS (Vercel) vs LOCAL
+// ============================================================
+if (process.env.VERCEL) {
+  // Vercel: 在模組載入時就初始化一次 (冷啟動), 暖函式會重用
+  let readyPromise = initializeDatabase();
+
+  // 在每個請求前確保 DB 已就緒
+  const wrappedApp = require('express')();
+  wrappedApp.use(async (req, res, next) => {
+    try {
+      await readyPromise;
+      next();
+    } catch (err) {
+      console.error('DB init failed:', err);
+      res.status(500).json({ error: 'Database init failed' });
+    }
+  });
+  wrappedApp.use(app);
+
+  module.exports = wrappedApp;
+} else {
+  // 本機: 正常啟動伺服器
+  initializeDatabase().then(() => {
+    process.on('SIGINT', () => { saveDatabase(); process.exit(0); });
+    process.on('SIGTERM', () => { saveDatabase(); process.exit(0); });
+    app.listen(PORT, () => {
+      console.log(`DUCK HR System running at http://localhost:${PORT}`);
+    });
+  }).catch(err => {
+    console.error('Failed to start server:', err);
+    process.exit(1);
+  });
+}

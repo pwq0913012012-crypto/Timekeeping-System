@@ -1,2 +1,7 @@
 node_modules/
 *.db
+*.bak
+.vercel
+.env
+.env.local
+*.log

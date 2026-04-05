@@ -110,6 +110,8 @@ async function doLogin() {
 
     token = data.token;
     currentUser = data.user;
+    // 重設跨實例打卡快取 (admin 登入時後端會清空打卡, 前端快取也要跟著清)
+    window.__latestMyRecord = null;
     try { sessionStorage.setItem('hr_token', token); sessionStorage.setItem('hr_user', JSON.stringify(currentUser)); } catch(e) {}
 
     document.getElementById('loginPage').style.display = 'none';
@@ -127,10 +129,27 @@ async function doLogin() {
   } catch(e) { console.error('Login error:', e); alert('登入發生錯誤: ' + e.message); }
 }
 
+async function doResetDemo() {
+  if (!confirm('確定要把所有展示資料重置成初始狀態嗎？\n\n• 所有打卡紀錄將會被清掉並重新產生\n• 所有請假/加班申請會重置\n• 公告會回到 3 則預設公告\n\n此操作無法復原。')) return;
+  try {
+    toast('重置中，請稍候...', 'info');
+    const data = await api('/admin/reset-demo', { method: 'POST', body: JSON.stringify({}) });
+    if (!data) return;
+    window.__latestMyRecord = null;
+    toast(data.message || '已重置', 'success');
+    // 重新載入頁面資料
+    updateBadges();
+    setTimeout(() => { navigate(currentPage || 'clock'); }, 300);
+  } catch (e) {
+    toast('重置失敗: ' + e.message, 'error');
+  }
+}
+
 function doLogout() {
   try { sessionStorage.removeItem('hr_token'); sessionStorage.removeItem('hr_user'); } catch(e) {}
   token = null;
   currentUser = null;
+  window.__latestMyRecord = null;
   document.getElementById('loginPage').style.display = '';
   document.getElementById('app').style.display = 'none';
   if (clockInterval) clearInterval(clockInterval);
@@ -205,13 +224,17 @@ function setBadge(id, count) {
   else { el.className = 'nav-badge'; el.textContent = count; }
 }
 
-async function updateBadges() {
+async function updateBadges(overrideMyRecord) {
   if (!currentUser) return;
   try {
     const data = await api('/dashboard');
     if (!data) return;
 
     // Clock badge
+    // 由於 serverless 跨實例可能導致 /dashboard 查到的 myRecord 與剛剛
+    // 打卡寫入的那個實例不同步，允許呼叫端傳入剛拿到的 record 覆蓋。
+    const myRecord = (overrideMyRecord !== undefined) ? overrideMyRecord : data.myRecord;
+
     const nowMin = getNowMin();
     const todayStr = today();
     const myShift = getUserShift(currentUser.id, todayStr);
@@ -221,10 +244,10 @@ async function updateBadges() {
     const myCrosses = myEndMin < myStartMin;
     const myShiftDone = myCrosses ? (nowMin > myEndMin && nowMin < myStartMin) : (nowMin > myEndMin);
     let clockBadge = 0;
-    if (!data.myRecord && nowMin >= myStartMin) {
+    if (!myRecord && nowMin >= myStartMin) {
       clockBadge = 1;
-    } else if (data.myRecord && !data.myRecord.clockOut && myShiftDone) {
-      const [ciH, ciM] = data.myRecord.clockIn.split(':').map(Number);
+    } else if (myRecord && !myRecord.clockOut && myShiftDone) {
+      const [ciH, ciM] = myRecord.clockIn.split(':').map(Number);
       const clockInMin = ciH * 60 + ciM;
       const clockedInBeforeEnd = myCrosses ? (clockInMin >= myStartMin || clockInMin <= myEndMin) : (clockInMin <= myEndMin);
       if (clockedInBeforeEnd) clockBadge = 1;
@@ -299,8 +322,14 @@ async function renderClock() {
   if (!data) return;
 
   cachedUsers = data.users || cachedUsers;
-  const myRecord = data.records.find(a => a.userId === currentUser.id && a.clockIn);
-  const hasClockedIn = !!myRecord, hasClockedOut = myRecord && myRecord.clockOut;
+  let myRecord = data.records.find(a => a.userId === currentUser.id && a.clockIn);
+  // 若前端剛剛打過卡，用本地快取蓋過可能不一致的 API 回傳
+  // (serverless 跨實例可能讓 API 回的 record 還是舊的)
+  if (window.__latestMyRecord && window.__latestMyRecord.date === today()) {
+    myRecord = window.__latestMyRecord;
+  }
+  const hasClockedIn = !!(myRecord && myRecord.clockIn);
+  const hasClockedOut = !!(myRecord && myRecord.clockOut);
 
   let statusHtml;
   if (!hasClockedIn) statusHtml = '<div class="clock-status"><span class="badge badge-warning">尚未打卡上班</span></div>';
@@ -340,8 +369,10 @@ async function doClockIn() {
     const data = await api('/attendance/clockin', { method: 'POST', body: JSON.stringify({}) });
     if (!data) return;
     toast(data.message, data.isLate ? 'error' : 'success');
+    // 把剛打卡成功的 record 快取到 renderClock 使用，避免被跨實例的舊資料蓋掉
+    window.__latestMyRecord = data.record;
     renderClock();
-    updateBadges();
+    updateBadges(data.record);
   } catch(e) { toast(e.message, 'error'); }
 }
 
@@ -350,8 +381,9 @@ async function doClockOut() {
     const data = await api('/attendance/clockout', { method: 'POST', body: JSON.stringify({}) });
     if (!data) return;
     toast(data.message, data.isEarly ? 'warning' : 'success');
+    window.__latestMyRecord = data.record;
     renderClock();
-    updateBadges();
+    updateBadges(data.record);
   } catch(e) { toast(e.message, 'error'); }
 }
 
