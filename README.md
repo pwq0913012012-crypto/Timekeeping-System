@@ -1,4 +1,4 @@
-# DUCK 企業打卡系統
+# DUCk 企業打卡系統
 
 Node.js + Express + SQLite 前後端分離的人力資源管理系統
 
