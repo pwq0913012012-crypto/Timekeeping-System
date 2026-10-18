@@ -1,4 +1,4 @@
-// 一次性：清洗本機 hr_system.db，把 admin 的打卡紀錄、所有請假、
+// 一次性：清洗本機 hr_system.db，把 admin 的打卡紀錄、所有請假
 // 所有加班資料清掉，讓部署上去的 DB 初始狀態是乾淨的。
 // 執行：node scripts/clean-db.js
 const fs = require('fs');
